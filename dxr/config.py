@@ -6,15 +6,14 @@ Please update docs/source/configuration.rst when you change this.
 from datetime import datetime
 from multiprocessing import cpu_count
 from ordereddict import OrderedDict
-from operator import attrgetter
 from os import getcwd
-from os.path import abspath, join
+from os.path import abspath
 
 from configobj import ConfigObj
 from funcy import merge
 from more_itertools import first
 from pkg_resources import resource_string
-from schema import Schema, Optional, Use, And, Schema, SchemaError
+from schema import Optional, Use, And, Schema, SchemaError
 
 from dxr.exceptions import ConfigError
 from dxr.plugins import all_plugins_but_core, core_plugin
@@ -24,6 +23,10 @@ from dxr.utils import cd, if_raises
 # Format version, signifying the instance format this web frontend code is
 # able to serve. Must match exactly; deploy will do nothing until it does.
 FORMAT = resource_string('dxr', 'format').strip()
+
+WORKERS_VALIDATOR = And(Use(int),
+                        lambda v: v >= 0,
+                        error='"workers" must be a non-negative integer.')
 
 
 class DotSection(object):
@@ -106,9 +109,7 @@ class Config(DotSection):
                 Optional('workers', default=if_raises(NotImplementedError,
                                                       cpu_count,
                                                       1)):
-                    And(Use(int),
-                        lambda v: v >= 0,
-                        error='"workers" must be a non-negative integer.'),
+                    WORKERS_VALIDATOR,
                 Optional('skip_stages', default=[]): WhitespaceList,
                 Optional('www_root', default=''): Use(lambda v: v.rstrip('/')),
                 Optional('google_analytics_key', default=''): basestring,
@@ -133,8 +134,13 @@ class Config(DotSection):
                         lambda v: v >= 0,
                         error='"es_indexing_timeout" must be a non-negative '
                               'integer.'),
+                Optional('es_indexing_retries', default=0):
+                    And(Use(int),
+                        lambda v: v >= 0,
+                        error='"es_indexing_retries" must be a non-negative '
+                              'integer.'),
                 Optional('es_refresh_interval', default=60):
-                    Use(int, error='"es_indexing_timeout" must be an integer.')
+                    Use(int, error='"es_refresh_interval" must be an integer.')
             },
             basestring: dict
         })
@@ -217,6 +223,7 @@ class TreeConfig(DotSectionWrapper):
             Optional('source_encoding', default='utf-8'): basestring,
             Optional('temp_folder', default=None): AbsPath,
             Optional('p4web_url', default='http://p4web/'): basestring,
+            Optional('workers', default=None): WORKERS_VALIDATOR,
             Optional(basestring): dict})
         tree = schema.validate(unvalidated_tree)
 
@@ -224,6 +231,8 @@ class TreeConfig(DotSectionWrapper):
             tree['temp_folder'] = config.temp_folder
         if tree['object_folder'] is None:
             tree['object_folder'] = tree['source_folder']
+        if tree['workers'] is None:
+            tree['workers'] = config.workers
 
         # Convert enabled_plugins to a list of plugins:
         if tree['disabled_plugins'].is_all:

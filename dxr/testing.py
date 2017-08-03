@@ -1,11 +1,11 @@
 import cgi
-from commands import getoutput, getstatusoutput
+from commands import getoutput
 import json
-from os import chdir, mkdir
+from os import mkdir
 from os.path import dirname, join
 import re
 from shutil import rmtree
-import subprocess
+from subprocess import check_call
 import sys
 from tempfile import mkdtemp
 import unittest
@@ -23,7 +23,7 @@ except ImportError:
 from dxr.app import make_app
 from dxr.build import index_and_deploy_tree
 from dxr.config import Config
-from dxr.utils import file_text, run
+from dxr.utils import cd, file_text, run
 
 
 class TestCase(unittest.TestCase):
@@ -36,11 +36,49 @@ class TestCase(unittest.TestCase):
     @classmethod
     def setup_class(cls):
         """Create a temporary DXR instance on the FS, and build it."""
-        cls._config_dir_path = mkdtemp()
+        cls.generate()
+        cls.index()
+        cls._es().refresh()
 
     @classmethod
     def teardown_class(cls):
+        cls._delete_es_indices()  # TODO: Replace with a call to 'dxr delete --force'.
+        cls.degenerate()
+
+    @classmethod
+    def generate(cls):
+        """Create any on-disk artifacts necessary before running the ``dxr
+        index`` job. Squirrel away the config file's dir path in
+        ``cls._config_dir_path``."""
+        cls._config_dir_path = mkdtemp()
+
+    @classmethod
+    def degenerate(cls):
+        """Remove any on-disk artifacts created by ``generate()``."""
         rmtree(cls._config_dir_path)
+
+    @classmethod
+    def index(cls):
+        """Run a DXR indexing job."""
+
+    @classmethod
+    def dxr_index(cls):
+        """Run the `dxr index` command in the config file's directory."""
+        with cd(cls._config_dir_path):
+            run('dxr index')
+
+    @classmethod
+    def this_dir(cls):
+        """Return the path to the dir containing the testcase class."""
+        # nose does some amazing magic that makes this work even if there are
+        # multiple test modules with the same name:
+        return dirname(sys.modules[cls.__module__].__file__)
+
+    @classmethod
+    def code_dir(cls):
+        """Return the path to the folder which typically contains the indexed
+        source code in tests with only one source tree."""
+        return join(cls._config_dir_path, 'code')
 
     def app(self):
         if not hasattr(self, '_app'):
@@ -88,20 +126,17 @@ class TestCase(unittest.TestCase):
         """Return the text of a source page."""
         return self.client().get('/code/source/%s' % path).data
 
-    def found_files(self, query, is_case_sensitive=True):
+    def found_files(self, query):
         """Return the set of paths of files found by a search query."""
         return set(result['path'] for result in
-                   self.search_results(query,
-                                       is_case_sensitive=is_case_sensitive))
+                   self.search_results(query))
 
-    def found_files_eq(self, query, filenames, is_case_sensitive=True):
+    def found_files_eq(self, query, filenames):
         """Assert that executing the search ``query`` finds the paths
         ``filenames``."""
-        eq_(self.found_files(query,
-                             is_case_sensitive=is_case_sensitive),
-            set(filenames))
+        eq_(self.found_files(query), set(filenames))
 
-    def found_line_eq(self, query, content, line, is_case_sensitive=True):
+    def found_line_eq(self, query, content, line):
         """Assert that a query returns a single file and single matching line
         and that its line number and content are as expected, modulo leading
         and trailing whitespace.
@@ -111,15 +146,12 @@ class TestCase(unittest.TestCase):
         zillion dereferences in your test.
 
         """
-        self.found_lines_eq(query,
-                            [(content, line)],
-                            is_case_sensitive=is_case_sensitive)
+        self.found_lines_eq(query, [(content, line)])
 
-    def found_lines_eq(self, query, expected_lines, is_case_sensitive=True):
+    def found_lines_eq(self, query, expected_lines):
         """Assert that a query returns a single file and that the highlighted
         lines are as expected, modulo leading and trailing whitespace."""
-        results = self.search_results(query,
-                                      is_case_sensitive=is_case_sensitive)
+        results = self.search_results(query)
         num_results = len(results)
         eq_(num_results, 1, msg='Query passed to found_lines_eq() returned '
                                  '%s files, not one.' % num_results)
@@ -127,25 +159,24 @@ class TestCase(unittest.TestCase):
         eq_([(line['line'].strip(), line['line_number']) for line in lines],
             expected_lines)
 
-    def found_nothing(self, query, is_case_sensitive=True):
+    def found_nothing(self, query):
         """Assert that a query returns no hits."""
-        results = self.search_results(query,
-                                      is_case_sensitive=is_case_sensitive)
+        results = self.search_results(query)
         eq_(results, [])
 
-    def search_response(self, query, is_case_sensitive=True):
+    def search_response(self, query):
         """Return the raw response of a JSON search query."""
         return self.client().get(
             self.url_for('.search',
                          tree='code',
                          q=query,
-                         redirect='false',
-                         case='true' if is_case_sensitive else 'false'),
+                         redirect='false'),
             headers={'Accept': 'application/json'})
 
-    def direct_result_eq(self, query, path, line_number, is_case_sensitive=True):
-        """Assert that a direct result exists and takes the user to the given
-        path at the given line number.
+    def redirect_result_eq(self, query, path, line_number, kind):
+        """Assert that a redirect result of the given kind ('direct' for a
+        direct result, 'single' for a single search result) is returned and
+        takes the user to the given path at the given line number.
 
         If line_number is None, assert we point to no particular line number.
 
@@ -154,38 +185,44 @@ class TestCase(unittest.TestCase):
             self.url_for('.search',
                          tree='code',
                          q=query,
-                         redirect='true',
-                         case='true' if is_case_sensitive else 'false'),
+                         redirect='true'),
             headers={'Accept': 'application/json'})
         eq_(response.status_code, 200)
         try:
             location = json.loads(response.data)['redirect']
         except KeyError:
-            self.fail("The query didn't return a direct result.")
+            self.fail("The query didn't return a redirect result.")
         eq_(location[:location.index('?')], '/code/source/' + path)
+
+        if kind == 'direct':
+            ok_('redirect_type=direct' in location)
+        elif kind == 'single':
+            ok_('redirect_type=single' in location)
+        else:
+            self.fail("Bad 'kind' value: %s" % kind)
+
         if line_number is None:
             # When line_number is None, assert we point to a file in general,
             # not to a particular line number:
             ok_('#' not in location)
         else:
             # Location is something like
-            # /code/source/main.cpp?from=main.cpp:6&case=true#6.
+            # /code/source/main.cpp?from=main.cpp:6#6.
             eq_(int(location[location.index('#') + 1:]), line_number)
 
-    def is_not_direct_result(self, query):
+    def is_not_redirect_result(self, query):
         """Assert that running a query results in a normal set of results,
-        possibly empty, as opposed to a direct result that redirects."""
+        possibly empty, as opposed to a result that redirects."""
         response = self.client().get(
             self.url_for('.search',
                          tree='code',
                          q=query,
-                         redirect='true',
-                         case='true'),
+                         redirect='true'),
             headers={'Accept': 'application/json'})
         eq_(response.status_code, 200)
         ok_('redirect' not in json.loads(response.data))
 
-    def search_results(self, query, is_case_sensitive=True):
+    def search_results(self, query):
         """Return the raw results of a JSON search query.
 
         Example::
@@ -204,8 +241,7 @@ class TestCase(unittest.TestCase):
           ]
 
         """
-        response = self.search_response(query,
-                                        is_case_sensitive=is_case_sensitive)
+        response = self.search_response(query)
         return json.loads(response.data)['results']
 
     def clang_at_least(self, version):
@@ -237,56 +273,101 @@ class TestCase(unittest.TestCase):
 
 
 class DxrInstanceTestCase(TestCase):
-    """Test case which builds an actual DXR instance that lives on the
-    filesystem and then runs its tests
+    """Test case which builds an actual DXR config that lives on the
+    filesystem
 
     This is suitable for complex tests with many files where the FS is the
-    least confusing place to express them.
+    most convenient place to express them.
 
     """
     @classmethod
-    def setup_class(cls):
-        """Build the instance."""
-        # nose does some amazing magic that makes this work even if there are
-        # multiple test modules with the same name:
-        cls._config_dir_path = dirname(sys.modules[cls.__module__].__file__)
-        chdir(cls._config_dir_path)
-        run('dxr index')
-        cls._es().refresh()
+    def generate(cls):
+        cls._config_dir_path = cls.this_dir()
+
+    @classmethod
+    def degenerate(cls):
+        """Don't delete anything."""
+
+    @classmethod
+    def index(cls):
+        cls.dxr_index()
 
     @classmethod
     def teardown_class(cls):
-        chdir(cls._config_dir_path)
-        cls._delete_es_indices()  # TODO: Replace with a call to 'dxr delete --force'.
-        run('dxr clean')
+        with cd(cls._config_dir_path):
+            run('dxr clean')
+        super(DxrInstanceTestCase, cls).teardown_class()
 
     @classmethod
     def config_input(cls, config_dir_path):
         return file_text(join(cls._config_dir_path, 'dxr.config'))
 
 
-class DxrInstanceTestCaseMakeFirst(DxrInstanceTestCase):
-    """Test case which runs `make` before dxr index and `make clean` before dxr
-    clean within a code directory, and otherwise delegates to DxrInstanceTestCase.
+class GenerativeTestCase(TestCase):
+    """Container for tests whose source-code folders are generated rather than
+    living permanently in DXR's source tree.
 
-    This test is suitable for cases where some setup must be performed before
-    `dxr index` can be run (for example extracting sources from archive).
+    You get one tree's source-code folder for free, and you can make more
+    yourself if you like.
 
     """
+    # Set this to True in a subclass to keep the generated instance around and
+    # host it on port 8000 so you can examine it:
+    stop_for_interaction = False
+
     @classmethod
-    def setup_class(cls):
-        build_dir = join(dirname(sys.modules[cls.__module__].__file__), 'code')
-        subprocess.check_call(['make'], cwd=build_dir)
-        super(DxrInstanceTestCaseMakeFirst, cls).setup_class()
+    def generate(cls):
+        """Make a "code" folder in the temp dir, and call ``generate_source()``
+        on my subclass."""
+        super(GenerativeTestCase, cls).generate()
+        code_path = cls.code_dir()
+        mkdir(code_path)
+        cls.generate_source()
+
+    @classmethod
+    def degenerate(cls):
+        """Don't delete anything."""
+
+    @classmethod
+    def index(cls):
+        for tree in cls.config().trees.itervalues():
+            index_and_deploy_tree(tree)
 
     @classmethod
     def teardown_class(cls):
-        build_dir = join(dirname(sys.modules[cls.__module__].__file__), 'code')
-        subprocess.check_call(['make', 'clean'], cwd=build_dir)
+        if cls.stop_for_interaction:
+            print "Pausing for interaction at 0.0.0.0:8000..."
+            make_app(cls.config()).run(host='0.0.0.0', port=8000)
+            print "Cleaning up indices..."
+        super(GenerativeTestCase, cls).teardown_class()
+
+    @classmethod
+    def generate_source(cls):
+        """Generate any source code a subclass wishes."""
+
+
+# TODO: Make into a GenerativeTestCase
+class DxrInstanceTestCaseMakeFirst(DxrInstanceTestCase):
+    """Test case which runs ``make`` before ``dxr index`` and ``make clean``
+    before ``dxr clean`` within a code directory and otherwise delegates to
+    DxrInstanceTestCase.
+
+    This test is suitable for cases where some setup must be performed before
+    ``dxr index`` can be run (for example extracting sources from archive).
+
+    """
+    @classmethod
+    def generate(cls):
+        check_call(['make'], cwd=join(cls.this_dir(), 'code'))
+        super(DxrInstanceTestCaseMakeFirst, cls).generate()
+
+    @classmethod
+    def teardown_class(cls):
+        check_call(['make', 'clean'], cwd=join(cls.this_dir(), 'code'))
         super(DxrInstanceTestCaseMakeFirst, cls).teardown_class()
 
 
-class SingleFileTestCase(TestCase):
+class SingleFileTestCase(GenerativeTestCase):
     """Container for tests that need only a single source file
 
     You can express the source as a string rather than creating a whole bunch
@@ -296,32 +377,12 @@ class SingleFileTestCase(TestCase):
     :cvar source_filename: The filename used for the source file
 
     """
-    # Set this to True in a subclass to keep the generated instance around and
-    # host it on port 8000 so you can examine it:
-    stop_for_interaction = False
-
     source_filename = 'main'
 
     @classmethod
-    def setup_class(cls):
-        """Create a temporary DXR instance on the FS, and build it."""
-        cls._config_dir_path = mkdtemp()
-        code_path = join(cls._config_dir_path, 'code')
-        mkdir(code_path)
-        _make_file(code_path, cls.source_filename, cls.source)
-
-        for tree in cls.config().trees.itervalues():
-            index_and_deploy_tree(tree)
-        cls._es().refresh()
-
-    @classmethod
-    def teardown_class(cls):
-        if cls.stop_for_interaction:
-            print "Pausing for interaction at 0.0.0.0:8000..."
-            make_app(cls.config()).run(host='0.0.0.0', port=8000)
-            print "Cleaning up indices..."
-        cls._delete_es_indices()
-        rmtree(cls._config_dir_path)
+    def generate_source(cls):
+        """Create a single file of source code on the FS."""
+        make_file(cls.code_dir(), cls.source_filename, cls.source)
 
     def _source_for_query(self, s):
         return (s.replace('<b>', '')
@@ -341,7 +402,7 @@ class SingleFileTestCase(TestCase):
                 0,
                 self.source.index(self._source_for_query(content))) + 1
 
-    def found_line_eq(self, query, content, line=None, is_case_sensitive=True):
+    def found_line_eq(self, query, content, line=None):
         """A specialization of ``found_line_eq`` that computes the line number
         if not given
 
@@ -353,9 +414,9 @@ class SingleFileTestCase(TestCase):
         if not line:
             line = self._guess_line(content)
         super(SingleFileTestCase, self).found_line_eq(
-                query, content, line, is_case_sensitive=is_case_sensitive)
+                query, content, line)
 
-    def found_lines_eq(self, query, expected_lines, is_case_sensitive=True):
+    def found_lines_eq(self, query, expected_lines):
         """A specialization of ``found_lines_eq`` that computes the line
         numbers if not given
 
@@ -374,18 +435,24 @@ class SingleFileTestCase(TestCase):
             return line
 
         expected_pairs = map(to_pair, expected_lines)
-        super(SingleFileTestCase, self).found_lines_eq(
-                query, expected_pairs, is_case_sensitive=is_case_sensitive)
+        super(SingleFileTestCase, self).found_lines_eq(query, expected_pairs)
 
-    def direct_result_eq(self, query, line_number, is_case_sensitive=True):
-        return super(SingleFileTestCase, self).direct_result_eq(
+    def direct_result_eq(self, query, line_number):
+        return self.redirect_result_eq(
             query,
             self.source_filename,
             line_number,
-            is_case_sensitive=is_case_sensitive)
+            'direct')
+
+    def single_result_eq(self, query, line_number):
+        return self.redirect_result_eq(
+            query,
+            self.source_filename,
+            line_number,
+            'single')
 
 
-def _make_file(path, filename, contents):
+def make_file(path, filename, contents):
     """Make file ``filename`` within ``path``, full of unicode ``contents``."""
     with open(join(path, filename), 'w') as file:
         file.write(contents.encode('utf-8'))

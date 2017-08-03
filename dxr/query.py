@@ -32,14 +32,13 @@ def direct_searchers(plugins):
 class Query(object):
     """Query object, constructor will parse any search query"""
 
-    def __init__(self, es_search, querystr, enabled_plugins, is_case_sensitive=True):
+    def __init__(self, es_search, querystr, enabled_plugins):
         self.es_search = es_search
         self.enabled_plugins = list(enabled_plugins)
-        self.is_case_sensitive = is_case_sensitive
 
         # A list of dicts describing query terms:
         grammar = query_grammar(self.enabled_plugins)
-        self.terms = QueryVisitor(is_case_sensitive=is_case_sensitive).visit(grammar.parse(querystr))
+        self.terms = QueryVisitor().visit(grammar.parse(querystr))
 
     def single_term(self):
         """Return the single, non-negated textual term in the query.
@@ -72,18 +71,16 @@ class Query(object):
                      highlight(line['content'][0].rstrip('\n\r'),
                                chain.from_iterable(h(line) for h in
                                                    content_highlighters)))
-                    for line in lines],
-                   False)
+                    for line in lines])
 
     def _file_query_results(self, results, path_highlighters):
         """Return an iterable of results of a FILE-domain query."""
         for file in results:
-            yield (icon(file['path'][0]),
+            yield (icon(file['path'][0], file.get('is_binary', False)),
                    highlight(file['path'][0],
                              chain.from_iterable(
                                  h(file) for h in path_highlighters)),
-                   [],
-                   file.get('is_binary', False))
+                   [])
 
     def results(self, offset=0, limit=100):
         """Return a count of search results and, as an iterable, the results
@@ -92,8 +89,7 @@ class Query(object):
             {'result_count': 12,
              'results': [(icon,
                           path within tree,
-                          [(line_number, highlighted_line_of_code), ...],
-                          whether it is binary),
+                          [(line_number, highlighted_line_of_code), ...]),
                          ...]}
 
         """
@@ -226,12 +222,13 @@ def query_grammar(plugins):
         terms = term*
         term = not_term / positive_term
         not_term = not positive_term
-        positive_term = filtered_term / text
+        positive_term = filtered_term / cased_text / text
 
         # A term with a filter name prepended:
-        filtered_term = maybe_plus filter ":" text
+        filtered_term = maybe_plus filter ":" (cased_text / text)
 
         # Bare or quoted text, possibly with spaces. Not empty.
+        cased_text = case text
         text = (double_quoted_text / single_quoted_text / bare_text) _
 
         filter = ~r"''' +
@@ -245,6 +242,8 @@ def query_grammar(plugins):
                             reverse=True)) + ur'''"
 
         not = "-"
+        # Stick an @ in front of text to negate the case-sensitivity guess.
+        case = "@"
 
         # You can stick a plus in front of anything, and it'll parse, but it has
         # meaning only with the filters where it makes sense.
@@ -278,22 +277,15 @@ class QueryVisitor(NodeVisitor):
         [{'name': 'path',
           'arg': 'ns*.cpp',
           'qualified': False,
-          'not': False,
-          'case_sensitive': False}]
+          'not': False}]
 
     """
     visit_positive_term = NodeVisitor.lift_child
 
-    def __init__(self, is_case_sensitive=False):
+    def __init__(self):
         """Construct.
-
-        :arg is_case_sensitive: What "case_sensitive" value to set on every
-            term. This is meant to be temporary, until we expose per-term case
-            sensitivity to the user.
-
         """
         super(NodeVisitor, self).__init__()
-        self.is_case_sensitive = is_case_sensitive
 
     def visit_query(self, query, (_, terms)):
         """Return a list of query term term_dicts."""
@@ -305,7 +297,6 @@ class QueryVisitor(NodeVisitor):
     def visit_term(self, term, (term_dict,)):
         """Set the case-sensitive bit and, if not already set, a default not
         bit."""
-        term_dict['case_sensitive'] = self.is_case_sensitive
         term_dict.setdefault('not', False)
         term_dict.setdefault('qualified', False)
         return term_dict
@@ -315,10 +306,15 @@ class QueryVisitor(NodeVisitor):
         term_dict['not'] = True
         return term_dict
 
-    def visit_filtered_term(self, filtered_term, (plus, filter, colon, term_dict)):
+    def visit_filtered_term(self, filtered_term, (plus, filter, colon, (term_dict,))):
         """Add fully-qualified indicator and the filter name to the term_dict."""
         term_dict['qualified'] = plus.text == '+'
         term_dict['name'] = filter.text
+        return term_dict
+
+    def visit_cased_text(self, cased_text, (at_, term_dict)):
+        """Force case_sensitive to True in the term_dict."""
+        term_dict['case_sensitive'] = True
         return term_dict
 
     def visit_text(self, text, ((some_text,), _)):
@@ -328,7 +324,9 @@ class QueryVisitor(NodeVisitor):
         ``visit_filtered_term`` will overrule us later.
 
         """
-        return {'name': 'text', 'arg': some_text}
+        # Case-sensitive if there's any uppercase characters in the term.
+        case_sensitive = any((c.isupper() for c in some_text))
+        return {'name': 'text', 'arg': some_text, 'case_sensitive': case_sensitive}
 
     def visit_maybe_plus(self, plus, wtf):
         """Keep the plus from turning into a list half the time. That makes it
@@ -376,6 +374,21 @@ def filters_by_name(plugins):
          chain.from_iterable(p.filters for p in plugins)))
 
 
+@cached
+def lang_badge_colors(plugins):
+    """Return a mapping of filter languages to their badge colors as defined by
+    provided plugins.
+
+    :arg plugins: An iterable of plugins from which to get badge colors
+
+    """
+    badges = {}
+    for p in plugins:
+        if p.badge_colors:
+            badges.update(p.badge_colors)
+    return badges
+
+
 def filter_menu_items(plugins):
     """Return the additional template variables needed to render filter.html.
 
@@ -383,17 +396,20 @@ def filter_menu_items(plugins):
         menu
 
     Language-agnostic filters come first (as they happen to be among the most
-    useful ones and are relatively few), then the rest, alphabetically. There
-    is room for better UI here. For instance, I'd like to badge each filter
-    with the languages it supports.
+    useful ones and are relatively few), then the rest, alphabetically.
 
     """
+    # Concretize to iterate over it more than once.
+    plugins = list(plugins)
     sorted_filters_by_name = sorted(
-        ((name, filters[0]) for name, filters in filters_by_name(plugins).items()),
-        key=lambda (name, filter): (hasattr(filter, 'lang'), name))
-    return (dict(name=name, description=filter.description)
-            for name, filter in sorted_filters_by_name
-            if filter.description)
+        ((name, filters) for name, filters in filters_by_name(plugins).iteritems()),
+        key=lambda (name, filters): (hasattr(filters[0], 'lang'), name))
+    badge_colors = lang_badge_colors(plugins)
+    return (dict(name=name,
+                 description=filters[0].description,
+                 badges=sorted((f.lang, badge_colors.get(f.lang)) for f in filters if hasattr(f, 'lang')))
+            for name, filters in sorted_filters_by_name
+            if filters[0].description)
 
 
 def highlight(content, extents):

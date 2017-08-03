@@ -6,7 +6,6 @@ unscathed.
 
 """
 from dxr.testing import DxrInstanceTestCase, menu_on, menu_item_not_on
-import nose.tools
 
 
 class MenuTests(DxrInstanceTestCase):
@@ -30,14 +29,20 @@ class MenuTests(DxrInstanceTestCase):
                  'href': '/code/search?q=%2Bfunction-decl%3Aanother_file%28%29'})
 
     def test_function_refs(self):
-        """Make sure definitions are found and a representative qualname-using
-        search is properly constructed."""
+        """Make sure qualname-using searches are properly constructed."""
         menu_on(self.source_page('main.cpp'),
                 'another_file',
                 {'html': 'Jump to definition',
-                 'href': '/code/source/extern.c#7'},
+                 'href': '/code/search?q=%2Bfunction%3Aanother_file%28%29&redirect=true'},
                 {'html': 'Find callers',
                  'href': '/code/search?q=%2Bcallers%3Aanother_file%28%29'})
+
+    def test_function_def_no_jump(self):
+        """Make sure a function definition doesn't get a 'Jump to definition'
+        entry."""
+        menu_item_not_on(self.source_page('extern.c'),
+                         'another_file',
+                         'Jump to definition')
 
     def test_variables(self):
         """Make sure var declarations are found and have a representative sane
@@ -155,7 +160,7 @@ class MenuTests(DxrInstanceTestCase):
         menu_on(self.source_page('extern.c'),
                 'fib',
                 {'html': 'Jump to definition',
-                 'href': '/code/source/extern.c#19'},
+                 'href': '/code/search?q=%2Bfunction%3AMyClass%3A%3Afib%28int%29&redirect=true'},
                 {'html': 'Find references',
                  'href': '/code/search?q=%2Bfunction-ref%3AMyClass%3A%3Afib%28int%29'})
 
@@ -283,3 +288,28 @@ class MenuTests(DxrInstanceTestCase):
                 'pVirtualFunc',
                 {'html': 'Find overridden',
                  'href': '/code/search?q=%2Boverridden%3ADerivedClass%3A%3ApVirtualFunc%28%29'})
+
+    def test_destructor_declaration(self):
+        """Make sure we link the full destructor name and not just the '~' on a
+        destructor declaration, which can be easily confused for one's
+        complement on the result of a function call."""
+        menu_on(self.source_page('BaseTypes.h'),
+                '~Z',
+                {'html': 'Find declarations',
+                 'href': '/code/search?q=%2Bfunction-decl%3AZ%3A%3A%7EZ%28%29'})
+
+    def test_destructor_def(self):
+        """Make sure we link the full destructor name and not just the '~' on a
+        destructor def."""
+        menu_on(self.source_page('Z.cpp'),
+                '~Z',
+                {'html': 'Find callers',
+                 'href': '/code/search?q=%2Bcallers%3AZ%3A%3A%7EZ%28%29'})
+
+    def test_destructor_call(self):
+        """Make sure we link the full destructor name and not just the '~' on a
+        destructor call."""
+        menu_on(self.source_page('main.cpp'),
+                '~Z',
+                {'html': 'Find references',
+                 'href': '/code/search?q=%2Bfunction-ref%3AZ%3A%3A%7EZ%28%29'})

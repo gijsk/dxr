@@ -1,8 +1,10 @@
 """Core, non-language-specific features of DXR, implemented as a Plugin"""
 
 from base64 import b64encode
+from datetime import datetime
 from itertools import chain
-from os.path import relpath, splitext, islink, realpath
+from os import stat
+from os.path import relpath, splitext, realpath, basename, split
 import re
 
 from flask import url_for
@@ -10,7 +12,8 @@ from funcy import identity
 from jinja2 import Markup
 from parsimonious import ParseError
 
-from dxr.es import UNINDEXED_STRING, UNINDEXED_INT, UNINDEXED_LONG
+from dxr.es import (UNINDEXED_STRING, UNANALYZED_STRING, UNINDEXED_INT,
+                    UNINDEXED_LONG)
 from dxr.exceptions import BadTerm
 from dxr.filters import Filter, negatable, FILE, LINE
 import dxr.indexers
@@ -19,13 +22,13 @@ from dxr.query import some_filters
 from dxr.plugins import direct_search
 from dxr.trigrammer import (regex_grammar, NGRAM_LENGTH, es_regex_filter,
                             NoTrigrams, PythonRegexVisitor)
-from dxr.utils import glob_to_regex
+from dxr.utils import glob_to_regex, split_content_lines, unicode_for_display
 
-__all__ = ['mappings', 'analyzers', 'TextFilter', 'PathFilter', 'ExtFilter',
-           'RegexpFilter', 'IdFilter', 'RefFilter']
+__all__ = ['mappings', 'analyzers', 'TextFilter', 'PathFilter', 'FilenameFilter',
+           'ExtFilter', 'RegexpFilter', 'IdFilter', 'RefFilter']
 
 
-PATH_MAPPING = {  # path/to/a/folder/filename.cpp
+PATH_SEGMENT_MAPPING = {  # some portion of a path/to/a/folder/filename.cpp string
     'type': 'string',
     'index': 'not_analyzed',  # support JS source fetching & sorting & browse() lookups
     'fields': {
@@ -41,12 +44,6 @@ PATH_MAPPING = {  # path/to/a/folder/filename.cpp
 }
 
 
-EXT_MAPPING = {
-    'type': 'string',
-    'index': 'not_analyzed'
-}
-
-
 mappings = {
     # We also insert entries here for folders. This gives us folders in dir
     # listings and the ability to find matches in folder pathnames.
@@ -56,26 +53,23 @@ mappings = {
         },
         'properties': {
             # FILE filters query this. It supports globbing via JS regex script.
-            'path': PATH_MAPPING,
+            'path': PATH_SEGMENT_MAPPING,  # path/to/a/folder/filename.cpp
 
-            'ext': EXT_MAPPING,
+            # Basename of path for fast lookup.
+            # FILE filters query this. It supports globbing via JS regex script.
+            'file_name': PATH_SEGMENT_MAPPING,  # filename.cpp
 
-            'link': {  # the target path if this FILE is a symlink
-                'type': 'string',
-                'index': 'not_analyzed'
-            },
+            'ext': UNANALYZED_STRING,
+
+            # the target path if this FILE is a symlink
+            'link': UNANALYZED_STRING,
 
             # Folder listings query by folder and then display filename, size,
             # and mod date.
-            'folder': {  # path/to/a/folder
-                'type': 'string',
-                'index': 'not_analyzed'
-            },
+            'folder': UNANALYZED_STRING,  # path/to/a/folder
 
-            'name': {  # filename.cpp or leaf_folder (for sorting and display)
-                'type': 'string',
-                'index': 'not_analyzed'
-            },
+            # filename.cpp or leaf_folder (for sorting and display)
+            'name': UNANALYZED_STRING,
             'size': UNINDEXED_INT,  # bytes. not present for folders.
             'modified': {  # not present for folders
                 'type': 'date',
@@ -92,6 +86,7 @@ mappings = {
                 'type': 'boolean',
                 'index': 'no'
             },
+            'description': UNINDEXED_STRING,
 
             # Sidebar nav links:
             'links': {
@@ -119,8 +114,9 @@ mappings = {
             'enabled': False
         },
         'properties': {
-            'path': PATH_MAPPING,
-            'ext': EXT_MAPPING,
+            'path': PATH_SEGMENT_MAPPING,
+            'file_name': PATH_SEGMENT_MAPPING,
+            'ext': UNANALYZED_STRING,
             # TODO: After the query language refresh, use match_phrase_prefix
             # queries on non-globbed paths, analyzing them with the path
             # analyzer, for max perf. Perfect! Otherwise, fall back to trigram-
@@ -283,7 +279,26 @@ class TextFilter(Filter):
                            maybe_lower(self._term['arg'])))
 
 
-class PathFilter(Filter):
+class _PathSegmentFilterBase(Filter):
+    """A base class for a filter that matches a glob against a path segment."""
+    domain = FILE
+
+    def _regex_filter(self, path_seg_property_name, no_trigrams_error_text):
+        """Return an ES regex filter that matches this filter's glob against the
+        path segment at path_seg_property_name.
+
+        """
+        glob = self._term['arg']
+        try:
+            return es_regex_filter(
+                regex_grammar.parse(glob_to_regex(glob)),
+                path_seg_property_name,
+                is_case_sensitive=self._term['case_sensitive'])
+        except NoTrigrams:
+            raise BadTerm(no_trigrams_error_text)
+
+
+class PathFilter(_PathSegmentFilterBase):
     """Substring filter for paths
 
     Pre-ES parity dictates that this simply searches for paths that have the
@@ -291,22 +306,29 @@ class PathFilter(Filter):
 
     """
     name = 'path'
-    domain = FILE
     description = Markup('File or directory sub-path to search within. <code>*'
                          '</code>, <code>?</code>, and <code>[...]</code> act '
                          'as shell wildcards.')
 
     @negatable
     def filter(self):
-        glob = self._term['arg']
-        try:
-            return es_regex_filter(
-                regex_grammar.parse(glob_to_regex(glob)),
-                'path',
-                is_case_sensitive=self._term['case_sensitive'])
-        except NoTrigrams:
-            raise BadTerm('Path globs need at least 3 literal characters in a row '
-                          'for speed.')
+        return self._regex_filter('path',
+                                  'Path globs need at least 3 literal '
+                                  'characters in a row for speed.')
+
+
+class FilenameFilter(_PathSegmentFilterBase):
+    """Substring filter for file names"""
+    name = 'file'
+    description = Markup('File to search within. <code>*</code>, '
+                         '<code>?</code>, and <code>[...]</code> act as shell '
+                         'wildcards.')
+
+    @negatable
+    def filter(self):
+        return self._regex_filter('file_name',
+                                  'File globs need at least 3 literal '
+                                  'characters in a row for speed.')
 
 
 class ExtFilter(Filter):
@@ -395,7 +417,9 @@ class IdFilter(FilterAggregator):
     name = 'id'
     domain = LINE
     description = Markup('Definition of an identifier: '
-                         '<code>id:someFunction</code> <code>id:SomeClass</code>')
+                         '<code>id:SomeClass</code> <code>id:@foofunction</code> '
+                         '(@ forces case-sensitive search, '
+                         'otherwise case-sensitive if not all lowercase)')
 
     def __init__(self, term, enabled_plugins):
         super(IdFilter, self).__init__(term, enabled_plugins, lambda f: f.is_identifier)
@@ -412,6 +436,20 @@ class RefFilter(FilterAggregator):
 
     def __init__(self, term, enabled_plugins):
         super(RefFilter, self).__init__(term, enabled_plugins, lambda f: f.is_reference)
+
+
+class FolderToIndex(dxr.indexers.FolderToIndex):
+    def needles(self):
+        rel_path = relpath(self.path, self.tree.source_folder)
+        # Convert from bag of bytes to unicode, which ES demands and the web
+        # likes:
+        rel_path = unicode_for_display(rel_path)
+        superfolder_path, folder_name = split(rel_path)
+        return [
+            ('path', [rel_path]),  # array for consistency with non-folder file docs
+            ('folder', superfolder_path),
+            ('name', folder_name)
+        ]
 
 
 class TreeToIndex(dxr.indexers.TreeToIndex):
@@ -434,24 +472,45 @@ class FileToIndex(dxr.indexers.FileToIndex):
         """Fill out path (and path.trigrams)."""
         if self.is_link():
             # realpath will keep following symlinks until it gets to the 'real' thing.
-            yield 'link', relpath(realpath(self.absolute_path()), self.tree.source_folder)
-        yield 'path', self.path
-        extension = splitext(self.path)[1]
+            yield 'link', relpath(realpath(self.absolute_path()),
+                                  self.tree.source_folder)
+        unicode_path = unicode_for_display(self.path)
+        yield 'path', unicode_path
+        yield 'file_name', basename(unicode_path)
+        extension = splitext(unicode_path)[1]
         if extension:
             yield 'ext', extension[1:]  # skip the period
         # We store both the contents of textual images twice so that they can
         # both show up in searches and be previewed in the browser.
         if is_binary_image(self.path) or is_textual_image(self.path):
+            # If the file was binary, then contents are None, so read it here.
+            if self.contents is None:
+                with open(self.absolute_path(), 'rb') as image_file:
+                    self.contents = image_file.read()
             bytestring = (self.contents.encode('utf-8') if self.contains_text()
                           else self.contents)
             yield 'raw_data', b64encode(bytestring)
         # binary, but not an image
         elif not self.contains_text():
             yield 'is_binary', True
+        # Find the last modified time from version control if possible,
+        # otherwise fall back to the timestamp from stat'ing the file.
+        modified = None
+        if self.vcs:
+            vcs_relative_path = relpath(self.absolute_path(),
+                                        self.vcs.get_root_dir())
+            try:
+                modified = self.vcs.last_modified_date(vcs_relative_path)
+            except NotImplementedError:
+                pass
+        if modified is None:
+            file_info = stat(self.absolute_path())
+            modified = datetime.utcfromtimestamp(file_info.st_mtime)
+        yield 'modified', modified
 
     def needles_by_line(self):
         """Fill out line number and content for every line."""
-        for number, text in enumerate(self.contents.splitlines(True), 1):
+        for number, text in enumerate(split_content_lines(self.contents), 1):
             yield [('number', number),
                    ('content', text)]
 
@@ -465,15 +524,16 @@ class FileToIndex(dxr.indexers.FileToIndex):
                    [('permalink', 'Permalink', url_for('.rev',
                                                        tree=self.tree.name,
                                                        revision=self.vcs.revision,
-                                                       path=self.path))])
+                                                       path=unicode_for_display(self.path)))])
+        else:
+            yield 5, 'Untracked file', []
+
         if is_textual_image(self.path):
             yield (4,
                    'Image',
                    [('svgview', 'View', url_for('.raw',
                                                 tree=self.tree.name,
-                                                path=self.path))])
-        else:
-            yield 5, 'Untracked file', []
+                                                path=unicode_for_display(self.path)))])
 
     def is_interesting(self):
         """Core plugin puts all files in the search index."""
@@ -511,9 +571,16 @@ def _path_trigram_filter(path, is_case_sensitive):
         regex = '(/|^){0}$'  # Start at any path segment.
 
     return es_regex_filter(
-            regex_grammar.parse(regex.format(re.escape(path))),
-            'path',
-            is_case_sensitive)
+        regex_grammar.parse(
+            regex.format(
+                re.escape(
+                    path.encode('ascii', 'backslashreplace')
+                )
+            )
+        ),
+        'path',
+        is_case_sensitive
+    )
 
 
 @direct_search(priority=100)

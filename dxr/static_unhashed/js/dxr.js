@@ -1,8 +1,7 @@
-/* jshint devel:true, esnext: true */
+/* jshint devel:true */
 /* globals nunjucks: true, $ */
 
 var htmlEscape;
-
 $(function() {
     'use strict';
 
@@ -13,6 +12,7 @@ $(function() {
     dxr.wwwRoot = constants.data('root');
     dxr.baseUrl = location.protocol + '//' + location.host;
     dxr.searchUrl = constants.data('search');
+    dxr.linesUrl = constants.data('lines');
     dxr.tree = constants.data('tree');
 
     var timeouts = {};
@@ -60,7 +60,9 @@ $(function() {
 
     // We also need to cater for the above scenario when a user clicks on in page links.
     window.onhashchange = function() {
-        scrollIntoView(window.location.hash.substr(1));
+        if (window.location.hash) {
+            scrollIntoView(window.location.hash.substr(1));
+        }
     };
 
     /**
@@ -83,15 +85,6 @@ $(function() {
     }
 
     /**
-     * If the `case` param is in the URL, returns its boolean value. Otherwise,
-     * returns null.
-     */
-    function caseFromUrl() {
-        var match = /[?&]?case=([^&]+)/.exec(location.search);
-        return match ? (match[1] === 'true') : null;
-    }
-
-    /**
      * Represents the path line displayed next to the file path label on individual document pages.
      * Also handles population of the path lines template in the correct format.
      *
@@ -99,7 +92,7 @@ $(function() {
      * @param {string} tree - The tree which was searched and in which this file can be found.
      * @param {string} icon - The icon string returned in the JSON payload.
      */
-    function buildResultHead(fullPath, tree, icon, isBinary) {
+    function buildResultHead(fullPath, tree, icon) {
         var pathLines = '',
             pathRoot = '/' + tree + '/source/',
             paths = fullPath.split('/'),
@@ -114,14 +107,15 @@ $(function() {
 
             dataPath.push(paths[pathIndex]);
 
+            // Render the path segment and trim white space so copying the
+            // path will not insert spaces.
             pathLines += nunjucks.render('path_line.html', {
                 'data_path': dataPath.join('/'),
                 'display_path': paths[pathIndex],
                 'url': pathRoot + dataPath.join('/'),
                 'is_first_or_only': isFirstOrOnly,
-                'is_dir': !isLastOrOnly,
-                'is_binary': isBinary
-            });
+                'is_dir': !isLastOrOnly
+            }).trim();
         }
 
         return [iconClass, pathLines];
@@ -130,7 +124,6 @@ $(function() {
     var searchForm = $('#basic_search'),
         queryField = $('#query'),
         query = null,
-        caseSensitiveBox = $('#case'),
         contentContainer = $('#content'),
         waiter = null,
         historyWaiter = null,
@@ -141,23 +134,8 @@ $(function() {
         resultsLineCount = 0,
         dataOffset = 0,
         previousDataLimit = 0,
-        defaultDataLimit = 100;
-
-    // Has the user been redirected to a direct result?
-    var fromQuery = /[?&]?from=([^&]+)/.exec(location.search);
-    if (fromQuery !== null) {
-        // Offer the user the option to see all the results instead.
-        var viewResultsTxt = 'Showing a direct result. <a href="{{ url }}">Show all results instead.</a>',
-            isCaseSensitive = caseFromUrl();
-
-        var searchUrl = constants.data('search') + '?q=' + fromQuery[1];
-        if (isCaseSensitive !== null) {
-            searchUrl += '&case=' + isCaseSensitive;
-        }
-
-        queryField.val(decodeURIComponent(fromQuery[1]));
-        showBubble('info', viewResultsTxt.replace('{{ url }}', searchUrl));
-    }
+        defaultDataLimit = 100,
+        lastURLWasSearch = false;  // Remember if the previous history URL was for a search (for popState).
 
     $(window).scroll(function() {
         didScroll = true;
@@ -167,17 +145,15 @@ $(function() {
      * Return the full Ajax URL for search.
      *
      * @param {string} query - The query string
-     * @param {bool} isCaseSensitive - Whether the query should be case-sensitive
      * @param {int} limit - The number of results to return.
      * @param {int} offset - The cursor position
      * @param {bool} redirect - Whether to redirect.
      */
-    function buildAjaxURL(query, isCaseSensitive, limit, offset, redirect) {
+    function buildAjaxURL(query, limit, offset, redirect) {
         var search = dxr.searchUrl;
         var params = {};
         params.q = query;
         params.redirect = redirect;
-        params['case'] = isCaseSensitive;
         params.limit = limit;
         params.offset = offset;
 
@@ -218,7 +194,7 @@ $(function() {
                 previousDataLimit = defaultDataLimit;
 
                 // Resubmit query for the next set of results, making sure redirect is turned off.
-                var requestUrl = buildAjaxURL(query, caseSensitiveBox.prop('checked'), defaultDataLimit, dataOffset, false);
+                var requestUrl = buildAjaxURL(query, defaultDataLimit, dataOffset, false);
                 doQuery(false, requestUrl, true);
             }
         }
@@ -245,15 +221,10 @@ $(function() {
     function querySoon() {
         clearTimeout(waiter);
         clearTimeout(historyWaiter);
-        waiter = setTimeout(doQuery, timeouts.search);
-    }
-
-    /**
-     * Saves checkbox checked property to localStorage and invokes queryNow function.
-     */
-    function updateLocalStorageAndQueryNow(){
-       localStorage.setItem('caseSensitive', $('#case').prop('checked'));
-       queryNow();
+        function doQueryPushHistory() {
+            doQuery(false, '', false, true);
+        }
+        waiter = setTimeout(doQueryPushHistory, timeouts.search);
     }
 
     /**
@@ -261,8 +232,138 @@ $(function() {
      */
     function queryNow(redirect) {
         clearTimeout(waiter);
-        doQuery(redirect);
+        doQuery(redirect, '', false, true);
     }
+
+    /**
+     * Add click listeners to the context buttons to load more contexts.
+     */
+    function withContextListeners(renderedResults) {
+        var toJquery = $(renderedResults);
+
+        // AJAX query as context lines after given row if after is true,
+        // otherwise before given row.
+        function getContextLines(row, query, after) {
+            $.ajax({
+                dataType: "json",
+                url: query,
+                success: function(data) {
+                    var result;
+                    if (data.lines.length > 0) {
+                        result = nunjucks.render('context_lines.html', {
+                            www_root: dxr.wwwRoot,
+                            tree: dxr.tree,
+                            result: data
+                        });
+                        if (after) {
+                            row.after(withContextListeners(result));
+                        } else {
+                            row.before(withContextListeners(result));
+                        }
+                        // Call cleanup after adding to remove unnecessary
+                        // buttons and duplicated result rows.
+                        cleanupResults(row.parent());
+                    }
+                }
+            });
+        }
+
+        // Before attaching the listeners call cleanup, since that may change
+        // or remove buttons.
+        toJquery.find(".result").each(function() {
+            cleanupResults($(this));
+        });
+        // Attach event listeners to each of the context spans, given by
+        // {klass, start offset, end offset}
+        [{klass: ".ctx_full", start: -3, end: 3, after: true},
+         {klass: ".ctx_up", start: -4, end: -1, after: false},
+         {klass: ".ctx_down", start: 1, end: 4, after: true}].forEach(
+                function(ctx) {
+                    var c = ctx;
+                    $(c.klass, toJquery).on('click', function() {
+                        var $this = $(this),
+                            path = $this.parents('.result').data('path'),
+                            line = parseInt($this.parents(".result_line").data('line')),
+                            queryString = (dxr.linesUrl + '?' +
+                                           $.param({path: path,
+                                                    start: line + c.start,
+                                                    end: line + c.end}));
+                        getContextLines($this.parents(".result_line"), queryString, c.after);
+                    });
+                });
+        return toJquery;
+    }
+
+    /**
+     * Visit the result lines in result and remove duplicated lines and redundant context buttons.
+     */
+    function cleanupResults(result) {
+        // Construct {line: {contextEl, resultEl}}
+        var lineMap = {};
+        var spaces, text, resultCode, lineNode, ctxSpan;
+        // Visit the lines and remove duplicates.
+        result.children('.result_line').each(function() {
+            var $this = $(this);
+            var line = parseInt($this.data("line"));
+            lineMap[line] = lineMap[line] || {};
+            if (this.classList.contains("ctx_row")) {
+                if (lineMap[line].contextEl) {
+                    // Then this is duplicate, remove it.
+                    $this.remove();
+                } else {
+                    lineMap[line].contextEl = this;
+                }
+            } else {
+                if (lineMap[line].resultEl) {
+                    // Then this is duplicate, remove it.
+                    $this.remove();
+                } else {
+                    lineMap[line].resultEl = this;
+                }
+            }
+        });
+        // Now go through and fix some things.
+        for (var line in lineMap) {
+            if (!lineMap.hasOwnProperty(line)) continue;
+            // If some line has both context and result, then replace context line by result line.
+            // But since result strips trailing whitespace where context has it,
+            // we must bring that from the context line.
+            if (lineMap[line].contextEl && lineMap[line].resultEl) {
+                text = lineMap[line].contextEl.querySelector("code").textContent;
+                resultCode = lineMap[line].resultEl.querySelector("code");
+                spaces = "";
+                for (var i = 0; i < text.length && /\s/.test(text[i]); i++) {
+                    spaces += text[i];
+                }
+                resultCode.innerHTML = spaces + resultCode.innerHTML;
+                $(lineMap[line].contextEl).replaceWith(lineMap[line].resultEl);
+            }
+            lineNode = lineMap[line].resultEl || lineMap[line].contextEl;
+            ctxSpan = lineNode.querySelector(".leftmost-column > span");
+            line = parseInt(line);
+            // If previous line exists, remove ctx_up. If below line exists, remove ctx_down.
+            // If surrounded, remove ctx_full.
+            if (ctxSpan && ((lineMap[line - 1] && ctxSpan.classList.contains("ctx_up")) ||
+                        (lineMap[line + 1] && ctxSpan.classList.contains("ctx_down")) ||
+                        (lineMap[line + 1] && lineMap[line - 1] &&
+                         ctxSpan.classList.contains("ctx_full")))) {
+                $(ctxSpan).remove();
+            }
+            // But if it's a ctx_full and either top or bottom exists, convert it to an arrow.
+            if (ctxSpan && ctxSpan.classList.contains("ctx_full")) {
+                if (lineMap[line + 1]) {
+                    ctxSpan.classList.add("ctx_up");
+                    ctxSpan.classList.remove("ctx_full");
+                    ctxSpan.textContent = "△";
+                } else if (lineMap[line - 1]) {
+                    ctxSpan.classList.add("ctx_down");
+                    ctxSpan.classList.remove("ctx_full");
+                    ctxSpan.textContent = "▽";
+                }
+            }
+        }
+    }
+
 
     /**
      * Populates the results template.
@@ -270,36 +371,40 @@ $(function() {
      * @param {bool} append - Should the content be appended or overwrite
      */
     function populateResults(data, append) {
+        var renderedData;
+        var params = {
+            q: data.query
+        };
+
         data.www_root = dxr.wwwRoot;
         data.tree = dxr.tree;
         data.top_of_tree = dxr.wwwRoot + '/' + data.tree + '/source/';
-
-        var params = {
-            q: data.query,
-            case: data.is_case_sensitive
-        };
         data.query_string = $.param(params);
 
         // If no data is returned, inform the user.
         if (!data.results.length) {
-            contentContainer
-                .empty()
-                .append(nunjucks.render('results_container.html', data));
+            resultsLineCount = 0;
+            if (!append) {
+                renderResultsNav(data);
+                contentContainer
+                    .empty()
+                    .append(nunjucks.render('results_container.html', data));
+            }
         } else {
             var results = data.results;
             resultsLineCount = countLines(results);
 
             for (var result in results) {
                 var icon = results[result].icon;
-                var resultHead = buildResultHead(results[result].path, data.tree, icon, results[result].is_binary);
+                var resultHead = buildResultHead(results[result].path, data.tree, icon);
                 results[result].iconClass = resultHead[0];
                 results[result].pathLine = resultHead[1];
             }
 
             if (!append) {
-                contentContainer
-                    .empty()
-                    .append(nunjucks.render('results_container.html', data));
+                renderedData = nunjucks.render('results_container.html', data);
+                contentContainer.empty().append(withContextListeners(renderedData));
+                renderResultsNav(data);
             } else {
                 var resultsList = contentContainer.find('.results');
 
@@ -311,16 +416,19 @@ $(function() {
                     '.result[data-path="' + firstResult.path + '"]');
                 if (domFirstResult.length) {
                     data.results = data.results.splice(1);
-                    domFirstResult.append(nunjucks.render('result_lines.html', {
+                    var renderedLines = nunjucks.render('result_lines.html', {
                         www_root: dxr.wwwRoot,
                         tree: dxr.tree,
                         result: firstResult
-                    }));
+                    });
+                    domFirstResult.append(withContextListeners(renderedLines));
                 }
 
                 // Don't render if there was only the first result and it was rendered.
                 if (data.results.length) {
-                    resultsList.append(nunjucks.render('results.html', data));
+                    renderedData = nunjucks.render('results.html', data);
+                    resultsList.append(withContextListeners(renderedData));
+                    renderResultsNav(data);
                 }
             }
         }
@@ -331,24 +439,42 @@ $(function() {
     }
 
     /**
+     * Renders/updates the nav bar for a set of search results
+     */
+    function renderResultsNav(data) {
+        var renderedNav = nunjucks.render('results_nav.html', data);
+        $('.current-tree-nav').empty().append(renderedNav);
+    }
+
+    /**
      * Queries and populates the results templates with the returned data.
      *
-     * @param {bool} [redirect] - Whether to redirect if we hit a direct result.
+     * @param {bool} [redirect] - Whether to redirect if we hit a direct or unique result.  Default is false.
      * @param {string} [queryString] - The url to which to send the request. If left out,
      * queryString will be constructed from the contents of the query field.
-     * @param {bool} [appendResults] - Whether to append new results to the current list,
-     * otherwise replace.
+     * @param {bool} [appendResults] - Append new results to the current list if true,
+     * otherwise replace.  Default is false.
+     * @param {bool} [addToHistory] - Whether to add this query to the browser history.  Default is false.
      */
-    function doQuery(redirect, queryString, appendResults) {
+    function doQuery(redirect, queryString, appendResults, addToHistory) {
         query = $.trim(queryField.val());
-        var myRequestNumber = nextRequestNumber,
-            lineHeight = parseInt(contentContainer.css('line-height'), 10),
-            limit = Math.floor((window.innerHeight / lineHeight) + 25);
+        var myRequestNumber = nextRequestNumber, limit, match, lineHeight;
 
-        redirect = redirect || false;
         // Turn into a boolean if it was undefined.
+        redirect = !!redirect;
         appendResults = !!appendResults;
-        queryString = queryString || buildAjaxURL(query, caseSensitiveBox.prop('checked'), limit, 0, redirect);
+        addToHistory = !!addToHistory;
+        if (queryString) {
+            // Normally there will be no explicit limit set in this case, but
+            // there's nothing stopping a user from setting it by hand in the
+            // url, so I guess we should check:
+            match = /[?&]limit=([0-9]+)/.exec(queryString);
+            limit = match ? match[1] : defaultDataLimit;
+        } else {
+            lineHeight = parseInt(contentContainer.css('line-height'), 10);
+            limit = Math.floor((window.innerHeight / lineHeight) + 25);
+            queryString = buildAjaxURL(query, limit, 0, redirect);
+        }
         function oneMoreRequest() {
             if (requestsInFlight === 0) {
                 $('#search-box').addClass('in-progress');
@@ -363,7 +489,8 @@ $(function() {
             }
         }
 
-        clearTimeout(historyWaiter);
+        if (!appendResults)
+            clearTimeout(historyWaiter);
 
         if (query.length === 0) {
             hideBubble();  // Don't complain when I delete what I typed. You didn't complain when it was empty before I typed anything.
@@ -383,9 +510,10 @@ $(function() {
             // tab feature on search pages (Chrome and Firefox).
             cache: appendResults,
             success: function (data) {
-                // Check whether to redirect to a direct hit.
+                // Check whether to redirect to a direct or single hit.
                 if (data.redirect) {
                     window.location.href = data.redirect;
+                    lastURLWasSearch = false;
                     return;
                 }
                 data.query = query;
@@ -393,26 +521,32 @@ $(function() {
                 if (myRequestNumber > displayedRequestNumber) {
                     displayedRequestNumber = myRequestNumber;
                     populateResults(data, appendResults);
-                    var pushHistory = function () {
-                        // Strip off offset= and limit= when updating.
-                        var displayURL = queryString.replace(/[&?]offset=\d+/, '').replace(/[&?]limit=\d+/, '');
-                        history.pushState({}, '', displayURL);
-                    };
-                    if (redirect)
-                        // Then the enter key was pressed and we want to update history state now.
-                        pushHistory();
-                    else if (!appendResults)
-                        // Update the history state if we're not appending: this is a new search.
-                        historyWaiter = setTimeout(pushHistory, timeouts.history);
+                    if (addToHistory) {
+                        var pushHistory = function () {
+                            // Strip off offset= and limit= when updating.
+                            var displayURL = removeParams(queryString, ['offset', 'limit']);
+                            history.pushState({}, '', displayURL);
+                            lastURLWasSearch = true;
+                        };
+                        if (redirect)
+                            // Then the enter key was pressed and we want to update history state now.
+                            pushHistory();
+                        else if (!appendResults)
+                            // Update the history state if we're not appending: this is a new search.
+                            historyWaiter = setTimeout(pushHistory, timeouts.history);
+                    }
+                    if (!appendResults) {
+                        previousDataLimit = limit;
+                        dataOffset = 0;
+                    }
+                    // If there were no results this time then we shouldn't turn
+                    // infinite scroll (back) on (otherwise if the number of
+                    // results exactly equals the limit we can end up sending a
+                    // query returning 0 results everytime we scroll).
+                    if (resultsLineCount)
+                        pollScrollPosition();
                 }
 
-                if (!appendResults) {
-                    previousDataLimit = limit;
-                    dataOffset = 0;
-                }
-
-                // Start the scroll pos poller.
-                pollScrollPosition();
                 oneFewerRequest();
             }
         })
@@ -438,20 +572,6 @@ $(function() {
         event.preventDefault();
         queryNow(true);
     });
-
-    // Update the search when the case-sensitive box is toggled, canceling any pending query:
-    caseSensitiveBox.on('change', updateLocalStorageAndQueryNow);
-
-
-    var urlCaseSensitive = caseFromUrl();
-    if (urlCaseSensitive !== null) {
-        // Any case-sensitivity specification in the URL overrides what was in localStorage:
-        localStorage.setItem('caseSensitive', urlCaseSensitive);
-    } else {
-        // Restore checkbox state from localStorage:
-        caseSensitiveBox.prop('checked', 'true' === localStorage.getItem('caseSensitive'));
-    }
-
 
     // Toggle the help box when the help icon is clicked, and hide it when
     // anything outside of the box is clicked.
@@ -503,6 +623,10 @@ $(function() {
         $(this).text(formatDate($(this).data('datetime')));
     });
 
+    function locationIsSearch() {
+        return /search$/.test(window.location.pathname) && window.location.search !== '';
+    }
+
     // Expose the DXR Object to the global object.
     window.dxr = dxr;
 
@@ -510,19 +634,20 @@ $(function() {
     // That means that if we naively set onpopstate, we would get into an
     // infinite loop of reloading whenever onpopstate is triggered. Therefore,
     // we have to only add our onpopstate handler once the page has loaded.
-    window.onload = function() {
+    window.addEventListener('load', function() {
         setTimeout(function() {
-            window.onpopstate = popStateHandler;
+            window.addEventListener('popstate', popStateHandler);
         }, 0);
-    };
+    });
 
     // Reload the page when we go back or forward.
     function popStateHandler(event) {
-        // Check for event state first to avoid nasty complete page reloads on #anchors:
-         if (event.state != null) {
+        if (locationIsSearch() ||  // If new location is a search, or...
+            lastURLWasSearch) {  // if we switched from search to file view:
             window.onpopstate = null;
             window.location.reload();
-         }
+        }
+        lastURLWasSearch = locationIsSearch();
     }
 
     /**
@@ -534,7 +659,6 @@ $(function() {
         var bg_src = href.replace('source', 'raw');
         anchorElement.style.backgroundImage = 'url(' + bg_src + ')';
     }
-
     window.addEventListener('load', function() {
         $(".image").not('.too_fat').each(function() {
             setBackgroundImageFromLink(this);
@@ -544,13 +668,15 @@ $(function() {
     // If on load of the search endpoint we have a query string then we need to
     // load the results of the query and activate infinite scroll.
     window.addEventListener('load', function() {
-        if (/search$/.test(window.location.pathname) && window.location.search) {
-            // Set case-sensitive checkbox according to the URL, and make sure
-            // the localstorage mirrors it.
-            var urlIsCaseSensitive = caseFromUrl() === true;
-            caseSensitiveBox.prop('checked', urlIsCaseSensitive);
-            localStorage.setItem('caseSensitive', urlIsCaseSensitive);
-            doQuery(false, window.location.href);
+        var savedURL, noRedirectURL;
+        lastURLWasSearch = locationIsSearch();
+        if (lastURLWasSearch) {
+            savedURL = window.location.href;
+            if (/[&?]redirect=true/.test(window.location.href)) {
+                noRedirectURL = removeParams(window.location.href, ['redirect']);
+                history.replaceState({}, '', noRedirectURL);
+            }
+            doQuery(false, savedURL);
         }
     });
 });

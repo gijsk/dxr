@@ -9,17 +9,24 @@ apt-get -q update \
         npm \
         python-pip python-virtualenv python2.7-dev \
         mercurial git \
-        llvm-3.5 libclang-3.5-dev clang-3.5 \
-        curl
+        llvm-3.8 libclang-3.8-dev clang-3.8 \
+        curl apt-transport-https
+
+# Install newer node.
+apt-get remove -y nodejs
+curl -s https://deb.nodesource.com/gpgkey/nodesource.gpg.key | apt-key add -
+DISTRO=$(lsb_release -c -s)
+echo "deb https://deb.nodesource.com/node_6.x ${DISTRO} main" > /etc/apt/sources.list.d/nodesource.list
+echo "deb-src https://deb.nodesource.com/node_6.x ${DISTRO} main" >> /etc/apt/sources.list.d/nodesource.list
+apt-get update
+apt-get install -y nodejs
 
 # Alias some things:
 #
 # --force overrides any older-version LLVM alternative lying around. This was
 # useful with vagrant, probably less so with ephemeral containers.
-update-alternatives --force --install /usr/local/bin/llvm-config llvm-config /usr/bin/llvm-config-3.5 0
+update-alternatives --force --install /usr/local/bin/llvm-config llvm-config /usr/bin/llvm-config-3.8 0
 # There is no clang++ until we do this:
-update-alternatives --force --install /usr/local/bin/clang++ clang++ /usr/bin/clang++-3.5 0
+update-alternatives --force --install /usr/local/bin/clang++ clang++ /usr/bin/clang++-3.8 0
 # And we might as well make a clang link so we can compile mozilla-central:
-update-alternatives --force --install /usr/local/bin/clang clang /usr/bin/clang-3.5 0
-# Homogenize names with RHEL. Perhaps not useful anymore.
-ln -sf /usr/bin/nodejs /usr/local/bin/node
+update-alternatives --force --install /usr/local/bin/clang clang /usr/bin/clang-3.8 0

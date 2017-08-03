@@ -5,26 +5,21 @@
 
   {% set state_eof = True %}
 
-  {% if sections %}
-    <div class="panel">
-      <button id="panel-toggle">
-        <span class="navpanel-icon expanded" aria-hidden="false"></span>
-        Navigation
-      </button>
-      <section id="panel-content" aria-expanded="true" aria-hidden="false">
-        {% for section in sections %}
-          <h4>{{ section.heading }}</h4>
-          <ul>
-            {% for item in section['items'] %}
-              <li>
-                <a href="{{ item.href }}" title="{{ item.title }}" class="{{ item.icon }} icon">{{ item.title }}</a>
-              </li>
-            {%- endfor %}
-          </ul>
-        {% endfor %}
-      </section>
-    </div>
-  {% endif %}
+  {% block bubble %}
+    {% if bubble %}
+      <div class="bubble info">
+        {% if bubble == 'single' %}
+          There was only 1 search result, so I took you straight to it.
+        {% else %}
+          Showing a direct result.
+          <a href="{{ url_for('.search', tree=tree, q=query) }}">
+          Show all results instead.</a>
+        {% endif %}
+      </div>
+    {% else %}
+      {{ super() }}
+    {% endif %}
+  {% endblock %}
 
   <div id="annotations">
     {% for line, annotations in lines %}
@@ -51,7 +46,7 @@
           {% endfor %}
         </td>
         <td class="code">
-          {% if not is_text %}
+          {% if is_binary %}
             (binary file)
           {% endif %}
 <pre>

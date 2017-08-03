@@ -2,7 +2,7 @@ import ast
 import os
 import re
 from contextlib import contextmanager
-
+from dxr.utils import split_content_lines
 
 # The actual check that Python uses seems to be done in C, but this
 # regex was taken from lib2to3.pgen.tokenize.
@@ -21,7 +21,7 @@ def ast_parse(contents):
         u''.join(
             # The encoding declaration is only meaningful in the top two lines.
             u'\n' if i < 2 and encoding_re.match(line) else line
-            for i, line in enumerate(contents.splitlines(True))
+            for i, line in enumerate(split_content_lines(contents))
         )
     )
 
@@ -47,6 +47,19 @@ def package_for_module(abs_module_name):
 def convert_node_to_name(node):
     """Convert an AST node to a name if possible. Return None if we
     can't (such as function calls).
+
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    elif isinstance(node, ast.Attribute):
+        return node.attr
+    else:
+        return None
+
+
+def convert_node_to_fullname(node):
+    """Convert an AST node to a full dotted name if possible. Return None
+    if we can't (such as function calls).
 
     """
     if isinstance(node, ast.Name):

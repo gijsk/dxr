@@ -54,7 +54,7 @@ except ImportError:
     from urllib.parse import urlparse  # 3.4
 # TODO: Probably use six to make urllib stuff work across 2/3.
 
-from pkg_resources import require, VersionConflict, DistributionNotFound
+from pkg_resources import require, VersionConflict, DistributionNotFound, safe_name
 
 # We don't admit our dependency on pip in setup.py, lest a naive user simply
 # say `pip install peep.tar.gz` and thus pull down an untrusted copy of pip
@@ -86,6 +86,7 @@ except ImportError:
         from pip.util import url_to_path  # 0.7.0
     except ImportError:
         from pip.util import url_to_filename as url_to_path  # 0.6.2
+from pip.exceptions import InstallationError
 from pip.index import PackageFinder, Link
 try:
     from pip.log import logger
@@ -104,7 +105,7 @@ except ImportError:
 
     DownloadProgressBar = DownloadProgressSpinner = NullProgressBar
 
-__version__ = 2, 5, 0
+__version__ = 3, 1, 2
 
 try:
     from pip.index import FormatControl  # noqa
@@ -122,6 +123,7 @@ ITS_FINE_ITS_FINE = 0
 SOMETHING_WENT_WRONG = 1
 # "Traditional" for command-line errors according to optparse docs:
 COMMAND_LINE_ERROR = 2
+UNHANDLED_EXCEPTION = 3
 
 ARCHIVE_EXTENSIONS = ('.tar.bz2', '.tar.gz', '.tgz', '.tar', '.zip')
 
@@ -362,9 +364,11 @@ def package_finder(argv):
     # Carry over PackageFinder kwargs that have [about] the same names as
     # options attr names:
     possible_options = [
-        'find_links', FORMAT_CONTROL_ARG, 'allow_external', 'allow_unverified',
-        'allow_all_external', ('allow_all_prereleases', 'pre'),
-        'process_dependency_links']
+        'find_links',
+        FORMAT_CONTROL_ARG,
+        ('allow_all_prereleases', 'pre'),
+        'process_dependency_links'
+    ]
     kwargs = {}
     for option in possible_options:
         kw, attr = option if isinstance(option, tuple) else (option, option)
@@ -661,6 +665,9 @@ class DownloadedReq(object):
         name = getattr(self._req.req, 'project_name', '')
         if name:
             return name
+        name = getattr(self._req.req, 'name', '')
+        if name:
+            return safe_name(name)
         raise ValueError('Requirement has no project_name.')
 
     def _name(self):
@@ -882,7 +889,7 @@ def peep_install(argv):
             first_every_last(buckets[SatisfiedReq], *printers)
 
         return ITS_FINE_ITS_FINE
-    except (UnsupportedRequirementError, DownloadError) as exc:
+    except (UnsupportedRequirementError, InstallationError, DownloadError) as exc:
         out(str(exc))
         return SOMETHING_WENT_WRONG
     finally:
@@ -902,16 +909,23 @@ def peep_port(paths):
         print('Please specify one or more requirements files so I have '
               'something to port.\n')
         return COMMAND_LINE_ERROR
+
+    comes_from = None
     for req in chain.from_iterable(
             _parse_requirements(path, package_finder(argv)) for path in paths):
+        req_path, req_line = path_and_line(req)
         hashes = [hexlify(urlsafe_b64decode((hash + '=').encode('ascii'))).decode('ascii')
-                  for hash in hashes_above(*path_and_line(req))]
+                  for hash in hashes_above(req_path, req_line)]
+        if req_path != comes_from:
+            print()
+            print('# from %s' % req_path)
+            print()
+            comes_from = req_path
+
         if not hashes:
             print(req.req)
-        elif len(hashes) == 1:
-            print('%s --hash=sha256:%s' % (req.req, hashes[0]))
         else:
-            print('%s' % req.req, end='')
+            print('%s' % (req.link if getattr(req, 'link', None) else req.req), end='')
             for hash in hashes:
                 print(' \\')
                 print('    --hash=sha256:%s' % hash, end='')
@@ -956,4 +970,4 @@ if __name__ == '__main__':
         exit(main())
     except Exception:
         exception_handler(*sys.exc_info())
-        exit(SOMETHING_WENT_WRONG)
+        exit(UNHANDLED_EXCEPTION)

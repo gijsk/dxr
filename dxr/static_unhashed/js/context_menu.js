@@ -1,4 +1,4 @@
-/* jshint devel:true, esnext: true */
+/* jshint devel:true */
 /* globals nunjucks: true, $ */
 
 $(function() {
@@ -6,7 +6,16 @@ $(function() {
     // Get the file content container
     var fileContainer = $('#file'),
         queryField = $('#query'),
-        contentContainer = $('#content');
+        contentContainer = $('#content'),
+        nonWordCharRE = /[^A-Z0-9_]/i;
+
+    if (['cpp', 'cc', 'cxx', 'h', 'hxx', 'hpp'].indexOf(
+          extension(window.location.pathname).toLowerCase()) > -1) {
+        // C++ files should include '~' as a valid name character.  (This
+        // doesn't cause us to accidentally scoop up '~' operators because those
+        // '~'s aren't in the same html node as the thing they operate on).
+        nonWordCharRE = /[^A-Z0-9_~]/i;
+    }
 
     /**
      * Highlight, or remove highlighting from, all symbols with the same class
@@ -16,12 +25,12 @@ $(function() {
      */
     function toggleSymbolHighlights(currentNode) {
         // First remove all highlighting
-        fileContainer.find('mark a').unwrap();
+        fileContainer.find('.clicking').removeClass('clicking');
 
         // Only add highlights if the currentNode is not undefined or null and
         // is an anchor link, as symbols will always be links.
         if (currentNode && currentNode[0].tagName === 'A') {
-            fileContainer.find('.' + currentNode.attr('class')).wrap('<mark />');
+            fileContainer.find('a[data-id=' + currentNode.data('id') + ']').addClass('clicking');
         }
     }
 
@@ -114,13 +123,13 @@ $(function() {
             var offset = selection.focusOffset,
                 node = selection.anchorNode,
                 selectedTxtString = node.nodeValue,
-                startIndex = selectedTxtString.regexLastIndexOf(/[^A-Z0-9_]/i, offset) + 1,
-                endIndex = selectedTxtString.regexIndexOf(/[^A-Z0-9_]/i, offset),
+                startIndex = selectedTxtString.regexLastIndexOf(nonWordCharRE, offset) + 1,
+                endIndex = selectedTxtString.regexIndexOf(nonWordCharRE, offset),
                 word = '';
 
             // If the regex did not find a start index, start from index 0
             if (startIndex === -1) {
-                start = 0;
+                startIndex = 0;
             }
 
             // If the regex did not find an end index, end at the position
@@ -130,7 +139,7 @@ $(function() {
             }
 
             // If the offset is beyond the last word, no word was clicked on.
-            if (offset === endIndex) {
+            if (offset > endIndex) {
                 return;
             }
 
@@ -145,7 +154,7 @@ $(function() {
             var contextMenu = {},
                 menuItems = [{
                     html: 'Search for the substring <strong>' + htmlEscape(word) + '</strong>',
-                    href: dxr.wwwRoot + "/" + encodeURIComponent(dxr.tree) + "/search?q=" + encodeURIComponent(word) + "&case=true",
+                    href: dxr.wwwRoot + "/" + encodeURIComponent(dxr.tree) + "/search?q=" + encodeURIComponent(word),
                     icon: 'search'
                 }];
 
@@ -160,15 +169,26 @@ $(function() {
             }
 
             contextMenu.menuItems = menuItems;
-            setContextMenu(fileContainer, contextMenu, event);
+            // Rather than putting the context menu in the file container,
+            // attaching it to the body makes the re-layout much quicker
+            // because the lines of the file do not need to be re-flowed.
+            // In the end they're the same, since the menu will be absolute'd
+            // to where it should go.
+            setContextMenu($('body'), contextMenu, event);
         }
     });
 
-    // Remove the menu when a user clicks outside it.
-    window.addEventListener('mousedown', function() {
+    function removeContextMenu() {
         toggleSymbolHighlights();
         $('#context-menu').remove();
-    }, false);
+    }
+
+    // Remove the menu when a user clicks outside it, or when the page is loaded
+    // via backward and forward history moves to this page, or via reload.
+    $(window).on('mousedown pageshow', removeContextMenu);
+
+    // Remove the menu when a user clicks on one of its links.
+    fileContainer.on('click', '#context-menu a', removeContextMenu);
 
     onEsc(function() {
         $('#context-menu').remove();

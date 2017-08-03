@@ -4,8 +4,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from errno import ENOENT
 import fnmatch
-from functools import partial, wraps
-from itertools import izip
+from functools import wraps
+from itertools import izip, imap
 from os import chdir, dup, fdopen, getcwd
 from os.path import join
 from shutil import rmtree
@@ -247,6 +247,13 @@ def cumulative_sum(nums):
         cum_sum += n
 
 
+def build_offset_map(lines):
+    """Return a list of byte offsets of the positions of the start of each
+    line, where lines is an iterable of strings.
+    """
+    return list(cumulative_sum(imap(len, lines)))
+
+
 @contextmanager
 def cd(path):
     """Change the working dir on enter, and change it back on exit."""
@@ -278,3 +285,45 @@ def is_in(needle, haystack):
 def without_ending(ending, string):
     """If ``string`` ends with ``ending``, strip it off."""
     return string[:-len(ending)] if string.endswith(ending) else string
+
+
+def split_content_lines(unicode):
+    """Split the content of a recognizably textual file into lines.
+
+    This is a single point of truth for how to do this between skimmers,
+    indexers, and other miscellany. At present, line breaks are included in the
+    resulting lines. Lines breaks are considered to be \n, \r, or \r\n.
+
+    """
+    lines = unicode.splitlines(True)
+    # Vertical Tabs, Form Feeds and some other characters are treated as
+    # end-of-lines by unicode.splitlines.
+    # See https://docs.python.org/2/library/stdtypes.html#unicode.splitlines
+    # Since we don't want those characters to be treated as line endings (since
+    # clang doesn't treat them so), we take the result and stitch any affected
+    # lines back together. We must maintain a consistent notion of line breaks
+    # across plugins in order for them to be able to collaborate on an
+    # individual file.
+
+    # str.splitlines behaves more as we desire but encoding, calling
+    # str.splitlines and then decoding again is slower.
+
+    # Using a frozenset here is faster than using a tuple.
+    non_line_endings = frozenset((u"\v", u"\f", u"\x1c", u"\x1d", u"\x1e",
+                                  u"\x85", u"\u2028", u"\u2029"))
+    def unsplit_some_lines(accum, x):
+        if accum and accum[-1] and accum[-1][-1] in non_line_endings:
+            accum[-1] += x
+        else:
+            accum.append(x)
+        return accum
+    return reduce(unsplit_some_lines, lines, [])
+
+
+def unicode_for_display(str):
+    """Return a unicode representation of a bytestring for showing to humans.
+
+    Different inputs may return the same output.
+
+    """
+    return str.decode('utf8', 'replace')

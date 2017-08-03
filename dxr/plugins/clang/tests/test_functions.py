@@ -27,19 +27,15 @@ class DefinitionTests(CSingleFileTestCase):
 
     def test_names(self):
         """Try searching for function names case-sensitively."""
-        self.found_line_eq(
-            'function:main', 'int <b>main</b>(int argc, char* argv[]) {')
-        self.found_line_eq(
-            'function:getHello', 'const char* <b>getHello</b>() {')
-        self.found_nothing(
-            'function:getHELLO')
+        self.found_line_eq('function:@main', 'int <b>main</b>(int argc, char* argv[]) {')
+        self.found_line_eq('function:getHello', 'const char* <b>getHello</b>() {')
+        self.found_nothing('function:getHELLO')
 
     def test_names_caseless(self):
         """Try searching for function names case-insensitively."""
         self.found_line_eq(
-            'function:MAIN',
-            'int <b>main</b>(int argc, char* argv[]) {',
-            is_case_sensitive=False)
+            'function:main',
+            'int <b>main</b>(int argc, char* argv[]) {')
 
     def test_qualnames_unqualified(self):
         """Qualnames should be found when searching unqualified as well."""
@@ -59,7 +55,7 @@ class DefinitionTests(CSingleFileTestCase):
         this behavior and didn't expressly condemn it.
 
         """
-        self.found_nothing('+function:SPACE::FOO(int)', is_case_sensitive=False)
+        self.found_nothing('+function:SPACE::FOO(int)')
 
 
 class TemplateClassMemberReferenceTests(CSingleFileTestCase):
@@ -98,6 +94,43 @@ class TemplateClassMemberReferenceTests(CSingleFileTestCase):
         raise SkipTest('The template params ("<int>") get into the qualified name. We do not want them in there; we want to search out all uses of the function, regardless of parametrization.')
         self.found_lines_eq('+function-ref:Foo::bar()',
                             [('Foo&lt;int&gt;().<b>bar</b>();', 16)])
+
+
+class TemplateMemberReferenceTests(CSingleFileTestCase):
+    """Tests for finding out where template member functions of a class are referenced or declared"""
+
+    source = r"""
+        class Foo
+        {
+        public:
+            template <typename T>
+            void bar();
+        };
+
+        template <typename T>
+        void Foo::bar()
+        {
+        }
+
+        void baz()
+        {
+            Foo().bar<int>();
+        }
+        """ + MINIMAL_MAIN
+
+    def test_function_decl(self):
+        """Try searching for function declaration."""
+        self.found_line_eq('+function-decl:Foo::bar()', 'void <b>bar</b>();')
+
+    def test_function(self):
+        """Try searching for function definition."""
+        self.found_lines_eq('+function:Foo::bar()',
+                            [('void Foo::<b>bar</b>()', 10)])
+
+    def test_function_ref(self):
+        """Try searching for function references."""
+        self.found_lines_eq('+function-ref:Foo::bar()',
+                            [('Foo().<b>bar</b>&lt;int&gt;();', 16)])
 
 
 class ConstTests(CSingleFileTestCase):

@@ -1,9 +1,7 @@
-import sys
-
 # Prevent spurious errors during `python setup.py test`, a la
 # http://www.eby-sarna.com/pipermail/peak/2010-May/003357.html:
 try:
-    import concurrent.futures
+    import concurrent.futures  # NOQA
 except ImportError:
     pass
 
@@ -24,9 +22,12 @@ setup(
                                   'clang = dxr.plugins.clang:plugin',
                                   'python = dxr.plugins.python:plugin',
                                   'omniglot = dxr.plugins.omniglot',
+                                  'descriptor = dxr.plugins.descriptor',
                                   'rust = dxr.plugins.rust:plugin',
                                   'xpidl = dxr.plugins.xpidl:plugin',
-                                  'pygmentize = dxr.plugins.pygmentize'],
+                                  'js = dxr.plugins.js:plugin',
+                                  'pygmentize = dxr.plugins.pygmentize',
+                                  'extmatch = dxr.plugins.extmatch'],
                   'console_scripts': ['dxr = dxr.cli:main']},
     install_requires=['click>=3.3,<5.0',
                       'configobj>=5.0.6',
@@ -39,8 +40,8 @@ setup(
                       'ordereddict>=1.1,<2.0',
                       'parsimonious>=0.6,<0.7',
                       'pyelasticsearch>=1.1,<2.0',
-                      'Pygments>=2.0.1,<3.0',
-                      'python-hglib>=1.7,<2.0',
+                      'Pygments>=2.1.3,<3.0',
+                      'python-hglib>=1.7,<3.0',
                       'tabulate>=0.7.5,<0.8',
                       'xpidl>=1.0',
                       'requests>=1.0,<2.0'],
@@ -63,3 +64,5 @@ setup(
         ],
     keywords=['lxr', 'static analysis', 'source code']
 )
+
+#noqa

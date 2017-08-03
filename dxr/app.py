@@ -1,34 +1,30 @@
 from cStringIO import StringIO
 from datetime import datetime
 from functools import partial
-from itertools import chain, imap, izip
+from itertools import chain, izip
 from logging import StreamHandler
 import os
-from os import chdir
-from os.path import join, basename, split, dirname, relpath
+from os.path import join, basename, split, dirname
 from sys import stderr
-from time import time
 from mimetypes import guess_type
-from urllib import quote_plus
 
-from flask import (Blueprint, Flask, send_from_directory, current_app,
-                   send_file, request, redirect, jsonify, render_template,
-                   url_for)
-from funcy import merge, imap
+from flask import (Blueprint, Flask, current_app, send_file, request, redirect,
+                   jsonify, render_template, url_for)
+from funcy import merge
 from pyelasticsearch import ElasticSearch
 from werkzeug.exceptions import NotFound
 
-from dxr.config import Config
 from dxr.es import (filtered_query, frozen_config, frozen_configs,
                     es_alias_or_not_found)
 from dxr.exceptions import BadTerm
 from dxr.filters import FILE, LINE
 from dxr.lines import html_line, tags_per_line, finished_tags, Ref, Region
-from dxr.mime import icon, is_binary_image, is_text
+from dxr.mime import icon, is_binary_image, is_textual_image, decode_data
 from dxr.plugins import plugins_named
 from dxr.query import Query, filter_menu_items
 from dxr.utils import (non_negative_int, decode_es_datetime, DXR_BLUEPRINT,
-                       format_number, append_update, append_by_line, cumulative_sum)
+                       format_number, append_by_line, build_offset_map,
+                       split_content_lines)
 from dxr.vcs import file_contents_at_rev
 
 # Look in the 'dxr' package for static files, etc.:
@@ -135,24 +131,33 @@ def search(tree):
     query_text = req.get('q', '')
     offset = non_negative_int(req.get('offset'), 0)
     limit = min(non_negative_int(req.get('limit'), 100), 1000)
-    is_case_sensitive = req.get('case') == 'true'
 
     # Make a Query:
     query = Query(partial(current_app.es.search,
                           index=frozen['es_alias']),
                   query_text,
-                  plugins_named(frozen['enabled_plugins']),
-                  is_case_sensitive=is_case_sensitive)
+                  plugins_named(frozen['enabled_plugins']))
 
     # Fire off one of the two search routines:
     searcher = _search_json if _request_wants_json() else _search_html
-    return searcher(query, tree, query_text, is_case_sensitive, offset, limit, config)
+    return searcher(query, tree, query_text, offset, limit, config)
 
 
-def _search_json(query, tree, query_text, is_case_sensitive, offset, limit, config):
+def _search_json(query, tree, query_text, offset, limit, config):
     """Try a "direct search" (for exact identifier matches, etc.). If we have a direct hit,
-    then return {redirect: hit location}.If that doesn't work, fall back to a normal search
-    and return the results as JSON."""
+    then return {redirect: hit location}. If that doesn't work, fall back to a normal
+    search, and if that yields a single result and redirect is true then return
+    {redirect: hit location}, otherwise return the results as JSON.
+
+    'redirect=true' along with 'redirect_type={direct, single}' control the behavior
+    of jumping to results:
+        * 'redirect_type=direct' indicates a direct_result result and comes with
+          a bubble giving the option to switch to all results instead.
+        * 'redirect_type=single' indicates a unique search result and comes with
+          a bubble indicating as much.
+    We only redirect to a direct/unique result if the original query contained a
+    'redirect=true' parameter, which the user can elicit by hitting enter on the query
+    input."""
 
     # If we're asked to redirect and have a direct hit, then return the url to that.
     if request.values.get('redirect') == 'true':
@@ -163,19 +168,29 @@ def _search_json(query, tree, query_text, is_case_sensitive, offset, limit, conf
             params = {
                 'tree': tree,
                 'path': path,
-                'from': query_text
+                'q': query_text,
+                'redirect_type': 'direct'
             }
-            if is_case_sensitive:
-                params['case'] = 'true'
             return jsonify({'redirect': url_for('.browse', _anchor=line, **params)})
     try:
         count_and_results = query.results(offset, limit)
+        # If we're asked to redirect and there's a single result, redirect to the result.
+        if (request.values.get('redirect') == 'true' and
+            count_and_results['result_count'] == 1):
+            _, path, line = next(count_and_results['results'])
+            line = line[0][0] if line else None
+            params = {
+                'tree': tree,
+                'path': path,
+                'q': query_text,
+                'redirect_type': 'single'
+            }
+            return jsonify({'redirect': url_for('.browse', _anchor=line, **params)})
         # Convert to dicts for ease of manipulation in JS:
         results = [{'icon': icon,
-                    'path': path,
-                    'lines': [{'line_number': nb, 'line': l} for nb, l in lines],
-                    'is_binary': is_binary}
-                   for icon, path, lines, is_binary in count_and_results['results']]
+                    'path': file_path,
+                    'lines': [{'line_number': nb, 'line': l} for nb, l in lines]}
+                   for icon, file_path, lines in count_and_results['results']]
     except BadTerm as exc:
         return jsonify({'error_html': exc.reason, 'error_level': 'warning'}), 400
 
@@ -185,10 +200,10 @@ def _search_json(query, tree, query_text, is_case_sensitive, offset, limit, conf
         'results': results,
         'result_count': count_and_results['result_count'],
         'result_count_formatted': format_number(count_and_results['result_count']),
-        'tree_tuples': _tree_tuples(query_text, is_case_sensitive)})
+        'tree_tuples': _tree_tuples('.search', q=query_text)})
 
 
-def _search_html(query, tree, query_text, is_case_sensitive, offset, limit, config):
+def _search_html(query, tree, query_text, offset, limit, config):
     """Return the rendered template for search.html.
 
     """
@@ -200,7 +215,6 @@ def _search_html(query, tree, query_text, is_case_sensitive, offset, limit, conf
                 plugins_named(frozen['enabled_plugins'])),
             'generated_date': frozen['generated_date'],
             'google_analytics_key': config.google_analytics_key,
-            'is_case_sensitive': is_case_sensitive,
             'query': query_text,
             'search_url': url_for('.search',
                                   tree=tree,
@@ -208,26 +222,30 @@ def _search_html(query, tree, query_text, is_case_sensitive, offset, limit, conf
                                   redirect='false'),
             'top_of_tree': url_for('.browse', tree=tree),
             'tree': tree,
-            'tree_tuples': _tree_tuples(query_text, is_case_sensitive),
+            'tree_tuples': _tree_tuples('.search', q=query_text),
             'www_root': config.www_root}
 
     return render_template('search.html', **template_vars)
 
 
-def _tree_tuples(query_text, is_case_sensitive):
+def _tree_tuples(endpoint, **kwargs):
     """Return a list of rendering info for Switch Tree menu items."""
     return [(f['name'],
-             url_for('.search',
+             url_for(endpoint,
                      tree=f['name'],
-                     q=query_text,
-                     **({'case': 'true'} if is_case_sensitive else {})),
-             f['description'])
+                     **kwargs),
+             f['description'],
+             [(lang, color) for p in plugins_named(f['enabled_plugins'])
+              for lang, color in sorted(p.badge_colors.iteritems())])
             for f in frozen_configs()]
 
 
 @dxr_blueprint.route('/<tree>/raw/<path:path>')
 def raw(tree, path):
     """Send raw data at path from tree, for binary things like images."""
+    if not is_binary_image(path) and not is_textual_image(path):
+        raise NotFound
+
     query = {
         'filter': {
             'term': {
@@ -247,6 +265,53 @@ def raw(tree, path):
         raise NotFound
     data_file = StringIO(data.decode('base64'))
     return send_file(data_file, mimetype=guess_type(path)[0])
+
+
+@dxr_blueprint.route('/<tree>/raw-rev/<revision>/<path:path>')
+def raw_rev(tree, revision, path):
+    """Send raw data at path from tree at the given revision, for binary things
+    like images."""
+    if not is_binary_image(path) and not is_textual_image(path):
+        raise NotFound
+
+    config = current_app.dxr_config
+    tree_config = config.trees[tree]
+    data = file_contents_at_rev(tree_config.source_folder, path, revision)
+    if data is None:
+        raise NotFound
+    data_file = StringIO(data)
+    return send_file(data_file, mimetype=guess_type(path)[0])
+
+
+@dxr_blueprint.route('/<tree>/lines/')
+def lines(tree):
+    """Return lines start:end of path in tree, where start, end, path are URL params.
+    """
+    req = request.values
+    path = req.get('path', '')
+    from_line = max(0, int(req.get('start', '')))
+    to_line = int(req.get('end', ''))
+    ctx_found = []
+    possible_hits = current_app.es.search(
+            {
+                'filter': {
+                    'and': [
+                        {'term': {'path': path}},
+                        {'range': {'number': {'gte': from_line, 'lte': to_line}}}
+                        ]
+                    },
+                '_source': {'include': ['content']},
+                'sort': ['number']
+            },
+            size=max(0, to_line - from_line + 1), # keep it non-negative
+            doc_type=LINE,
+            index=es_alias_or_not_found(tree))
+    if 'hits' in possible_hits and len(possible_hits['hits']['hits']) > 0:
+        for hit in possible_hits['hits']['hits']:
+            ctx_found.append({'line_number': hit['sort'][0],
+                              'line': hit['_source']['content'][0]})
+
+    return jsonify({'lines': ctx_found, 'path': path})
 
 
 @dxr_blueprint.route('/<tree>/source/')
@@ -269,12 +334,13 @@ def browse(tree, path=''):
             FILE,
             filter={'path': path},
             size=1,
-            include=['link', 'links'])
+            include=['link', 'links', 'is_binary'])
         if not files:
             raise NotFound
-        if 'link' in files[0]:
+        file_doc = files[0]
+        if 'link' in file_doc:
             # Then this path is a symlink, so redirect to the real thing.
-            return redirect(url_for('.browse', tree=tree, path=files[0]['link'][0]))
+            return redirect(url_for('.browse', tree=tree, path=file_doc['link'][0]))
 
         lines = filtered_query(
             frozen['es_alias'],
@@ -288,7 +354,18 @@ def browse(tree, path=''):
         for doc in lines:
             doc['content'] = doc['content'][0]
 
-        return _browse_file(tree, path, lines, files[0], config, frozen['generated_date'])
+        return _browse_file(tree, path, lines, file_doc, config,
+                            file_doc.get('is_binary', [False])[0],
+                            frozen['generated_date'])
+
+
+def concat_plugin_headers(plugin_list):
+    """Return a list of the concatenation of all browse_headers in the
+    FolderToIndexes of given plugin list.
+
+    """
+    return list(chain.from_iterable(p.folder_to_index.browse_headers
+                                    for p in plugin_list if p.folder_to_index))
 
 
 def _browse_folder(tree, path, config):
@@ -298,15 +375,29 @@ def _browse_folder(tree, path, config):
     listing. Otherwise, raise NotFound.
 
     """
+    def item_or_list(item):
+        """If item is a list, return its first element.
+
+        Otherwise, just return it.
+
+        """
+        # TODO @pelmers: remove this function when format bumps to 20
+        if isinstance(item, list):
+            return item[0]
+        return item
+
     frozen = frozen_config(tree)
 
+    plugin_headers = concat_plugin_headers(plugins_named(frozen['enabled_plugins']))
     files_and_folders = filtered_query(
         frozen['es_alias'],
         FILE,
         filter={'folder': path},
         sort=[{'is_folder': 'desc'}, 'name'],
-        size=10000,
-        exclude=['raw_data'])
+        size=1000000,
+        include=['name', 'modified', 'size', 'link', 'path', 'is_binary',
+                 'is_folder'] + plugin_headers)
+
     if not files_and_folders:
         raise NotFound
 
@@ -315,14 +406,11 @@ def _browse_folder(tree, path, config):
         # Common template variables:
         www_root=config.www_root,
         tree=tree,
-        tree_tuples=[
-            (t['name'],
-             url_for('.parallel', tree=t['name'], path=path),
-             t['description'])
-            for t in frozen_configs()],
+        tree_tuples=_tree_tuples('.parallel', path=path),
         generated_date=frozen['generated_date'],
         google_analytics_key=config.google_analytics_key,
         paths_and_names=_linked_pathname(path, tree),
+        plugin_headers=plugin_headers,
         filters=filter_menu_items(
             plugins_named(frozen['enabled_plugins'])),
         # Autofocus only at the root of each tree:
@@ -334,10 +422,10 @@ def _browse_folder(tree, path, config):
         files_and_folders=[
             (_icon_class_name(f),
              f['name'],
-             decode_es_datetime(f['modified']) if 'modified' in f else None,
+             decode_es_datetime(item_or_list(f['modified'])) if 'modified' in f else None,
              f.get('size'),
-             url_for('.browse', tree=tree, path=f.get('link', f['path'])[0]),
-             f.get('is_binary', [False])[0])
+             [f.get(h, [''])[0] for h in plugin_headers],
+             url_for('.browse', tree=tree, path=f.get('link', f['path'])[0]))
             for f in files_and_folders])
 
 
@@ -356,29 +444,18 @@ def skim_file(skimmers, num_lines):
             refses.append(skimmer.refs())
             regionses.append(skimmer.regions())
             append_by_line(annotations_by_line, skimmer.annotations_by_line())
-    links = [{'order': order,
-              'heading': heading,
-              'items': [{'icon': icon,
-                         'title': title,
-                         'href': href}
-                        for icon, title, href in items]}
-             for order, heading, items in
-             chain.from_iterable(linkses)]
+    links = dictify_links(chain.from_iterable(linkses))
     return links, refses, regionses, annotations_by_line
 
 
-def _build_common_file_template(tree, path, date, config):
+def _build_common_file_template(tree, path, is_binary, date, config):
     """Return a dictionary of the common required file template parameters.
     """
     return {
         # Common template variables:
         'www_root': config.www_root,
         'tree': tree,
-        'tree_tuples':
-            [(t['name'],
-              url_for('.parallel', tree=t['name'], path=path),
-              t['description'])
-            for t in frozen_configs()],
+        'tree_tuples': _tree_tuples('.parallel', path=path),
         'generated_date': date,
         'google_analytics_key': config.google_analytics_key,
         'filters': filter_menu_items(
@@ -386,13 +463,14 @@ def _build_common_file_template(tree, path, date, config):
         # File template variables
         'paths_and_names': _linked_pathname(path, tree),
         'icon_url': url_for('.static',
-                            filename='icons/mimetypes/%s.png' % icon(path)),
+                            filename='icons/mimetypes/%s.png' % icon(path, is_binary)),
         'path': path,
         'name': basename(path)
     }
 
 
-def _browse_file(tree, path, line_docs, file_doc, config, date=None, contents=None):
+def _browse_file(tree, path, line_docs, file_doc, config, is_binary,
+                 date=None, contents=None, image_rev=None):
     """Return a rendered page displaying a source file.
 
     :arg string tree: name of tree on which file is found
@@ -401,16 +479,30 @@ def _browse_file(tree, path, line_docs, file_doc, config, date=None, contents=No
         where the `content` field is dereferenced
     :arg file_doc: the FILE document as defined in core.py
     :arg config: TreeConfig object of this tree
+    :arg is_binary: Whether file is binary or not
     :arg date: a formatted string representing the generated date, default to now
     :arg string contents: the contents of the source file, defaults to joining
         the `content` field of all line_docs
+    :arg image_rev: revision number of a textual or binary image, for images
+        displayed at a certain rev
     """
+    def process_link_templates(sections):
+        """Look for {{line}} in the links of given sections, and duplicate them onto
+        a 'template' field.
+        """
+        for section in sections:
+            for link in section['items']:
+                if '{{line}}' in link['href']:
+                    link['template'] = link['href']
+                    link['href'] = link['href'].replace('{{line}}', '')
+
     def sidebar_links(sections):
         """Return data structure to build nav sidebar from. ::
 
             [('Section Name', [{'icon': ..., 'title': ..., 'href': ...}])]
 
         """
+        process_link_templates(sections)
         # Sort by order, resolving ties by section name:
         return sorted(sections, key=lambda section: (section['order'],
                                                      section['heading']))
@@ -421,21 +513,39 @@ def _browse_file(tree, path, line_docs, file_doc, config, date=None, contents=No
         # time would always be used.
         date = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S +0000")
 
-    common = _build_common_file_template(tree, path, date, config)
+    common = _build_common_file_template(tree, path, is_binary, date, config)
     links = file_doc.get('links', [])
     if is_binary_image(path):
         return render_template(
             'image_file.html',
-            **common)
-    else:  # We don't allow browsing binary files, so this must be a text file.
+            **merge(common, {
+                'sections': sidebar_links(links),
+                'revision': image_rev}))
+    elif is_binary:
+        return render_template(
+            'text_file.html',
+            **merge(common, {
+                'lines': [],
+                'is_binary': True,
+                'sections': sidebar_links(links)}))
+    else:
         # We concretize the lines into a list because we iterate over it multiple times
         lines = [doc['content'] for doc in line_docs]
         if not contents:
             # If contents are not provided, we can reconstruct them by
             # stitching the lines together.
             contents = ''.join(lines)
-        offsets = cumulative_sum(imap(len, lines))
+        offsets = build_offset_map(lines)
         tree_config = config.trees[tree]
+        if is_textual_image(path) and image_rev:
+            # Add a link to view textual images on revs:
+            links.extend(dictify_links([
+                (4,
+                 'Image',
+                 [('svgview', 'View', url_for('.raw_rev',
+                                              tree=tree_config.name,
+                                              path=path,
+                                              revision=image_rev))])]))
         # Construct skimmer objects for all enabled plugins that define a
         # file_to_skim class.
         skimmers = [plugin.file_to_skim(path,
@@ -466,8 +576,9 @@ def _browse_file(tree, path, line_docs, file_doc, config, date=None, contents=No
                            doc.get('annotations', []) + skim_annotations)
                           for doc, tags_in_line, offset, skim_annotations
                               in izip(line_docs, tags_per_line(tags), offsets, annotationses)],
-                'is_text': True,
-                'sections': sidebar_links(links + skim_links)}))
+                'sections': sidebar_links(links + skim_links),
+                'query': request.args.get('q', ''),
+                'bubble': request.args.get('redirect_type')}))
 
 
 @dxr_blueprint.route('/<tree>/rev/<revision>/<path:path>')
@@ -477,17 +588,29 @@ def rev(tree, revision, path):
     """
     config = current_app.dxr_config
     tree_config = config.trees[tree]
-    abs_path = join(tree_config.source_folder, path)
-    contents = file_contents_at_rev(abs_path, revision)
-    if contents is not None and is_text(contents):
-        contents = contents.decode(tree_config.source_encoding)
+    contents = file_contents_at_rev(tree_config.source_folder, path, revision)
+    if contents is not None:
+        image_rev = None
+        if is_binary_image(path):
+            is_text = False
+            contents = ''
+            image_rev = revision
+        else:
+            is_text, contents = decode_data(contents, tree_config.source_encoding)
+            if not is_text:
+                contents = ''
+            elif is_textual_image(path):
+                image_rev = revision
+
         # We do some wrapping to mimic the JSON returned by an ES lines query.
         return _browse_file(tree,
                             path,
-                            [{'content': line} for line in contents.splitlines(True)],
+                            [{'content': line} for line in split_content_lines(contents)],
                             {},
                             config,
-                            contents=contents)
+                            not is_text,
+                            contents=contents,
+                            image_rev=image_rev)
     else:
         raise NotFound
 
@@ -556,7 +679,7 @@ def _icon_class_name(file_doc):
     """Return a string for the CSS class of the icon for file document."""
     if file_doc['is_folder']:
         return 'folder'
-    class_name = icon(file_doc['name'])
+    class_name = icon(file_doc['name'], file_doc.get('is_binary', [False])[0])
     # for small images, we can turn the image into icon via javascript
     # if bigger than the cutoff, we mark it as too big and don't do this
     if file_doc['size'] > current_app.dxr_config.max_thumbnail_size:
@@ -578,3 +701,14 @@ def _request_wants_json():
     return (best == 'application/json' and
             request.accept_mimetypes[best] >
                     request.accept_mimetypes['text/html'])
+
+
+def dictify_links(links):
+    """Return a chain of order, heading, items links as a list of dicts."""
+    return [{'order': order,
+             'heading': heading,
+             'items': [{'icon': icon,
+                        'title': title,
+                        'href': href}
+                       for icon, title, href in items]}
+            for order, heading, items in links]

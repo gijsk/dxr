@@ -2,8 +2,8 @@ from nose.tools import ok_, eq_
 
 from dxr.testing import DxrInstanceTestCaseMakeFirst
 
-LATEST_REVISION = "5e2b2b554eb86f90e189217fa9dc2eba66259910"
-PREVIOUS_REVISION = "cb339834998124cb8165aa35ed4635c51b6ac5c2"
+LATEST_REVISION = "9a943d9f121733d0beff4b04331747750f40614a"
+OLDER_REVISION = "cb339834998124cb8165aa35ed4635c51b6ac5c2"
 
 class GitTests(DxrInstanceTestCaseMakeFirst):
     """Test our Git integration, both core and omniglot."""
@@ -16,7 +16,8 @@ class GitTests(DxrInstanceTestCaseMakeFirst):
     def test_blame(self):
         """Make sure the blame link exists and goes to the right place."""
         response = self.client().get('/code/source/main.c')
-        ok_('/blame/%s/main.c" title="Blame" class="blame icon">Blame</a>' % LATEST_REVISION in response.data)
+        ok_('/blame/%s/main.c#L" title="Blame" class="blame icon"' % LATEST_REVISION in response.data)
+        ok_('/blame/%s/main.c#L{{line}}">Blame' % LATEST_REVISION in response.data)
 
     def test_raw(self):
         """Make sure the raw link exists and goes to the right place."""
@@ -32,10 +33,32 @@ class GitTests(DxrInstanceTestCaseMakeFirst):
         """Make sure the permalink link exists and goes to the right place."""
         response = self.client().get('/code/source/main.c')
         ok_('/rev/%s/main.c" title="Permalink" class="permalink icon">Permalink</a>' % LATEST_REVISION in response.data)
-        # Test that it works for this revision and the last one.
+        # Test that it works for this revision and an older one.
         response = self.client().get('/code/rev/%s/main.c' % LATEST_REVISION)
         eq_(response.status_code, 200)
-        response = self.client().get('/code/rev/%s/main.c' % PREVIOUS_REVISION)
+        response = self.client().get('/code/rev/%s/main.c' % OLDER_REVISION)
+        eq_(response.status_code, 200)
+
+    def test_binary_permalink(self):
+        """Make sure the permalink link exists for a binary file, and that the
+        permalink version of binary_file shows '(binary file)'."""
+        response = self.client().get('/code/source/binary_file')
+        ok_('/rev/%s/binary_file" title="Permalink" class="permalink icon">Permalink</a>' % LATEST_REVISION in response.data)
+        response = self.client().get('/code/rev/%s/binary_file' % LATEST_REVISION)
+        ok_('(binary file)' in response.data)
+
+    def test_binary_image_permalink(self):
+        """Make sure we display a binary image in its permalink."""
+        response = self.client().get('/code/rev/%s/rev_circle.jpg' % LATEST_REVISION)
+        ok_('src="/code/raw-rev/%s/rev_circle.jpg"' % LATEST_REVISION in response.data)
+        response = self.client().get('/code/raw-rev/%s/rev_circle.jpg' % LATEST_REVISION)
+        eq_(response.status_code, 200)
+
+    def test_textual_image_permalink(self):
+        """Make sure we display an image link for textual image permalinks."""
+        response = self.client().get('/code/rev/%s/rev_circle.svg' % LATEST_REVISION)
+        ok_('href="/code/raw-rev/%s/rev_circle.svg"' % LATEST_REVISION in response.data)
+        response = self.client().get('/code/raw-rev/%s/rev_circle.svg' % LATEST_REVISION)
         eq_(response.status_code, 200)
 
     def test_deep_permalink(self):
@@ -50,11 +73,21 @@ class GitTests(DxrInstanceTestCaseMakeFirst):
         eq_(response.status_code, 200)
         ok_("This file tests" in response.data)
 
+    def test_mdates(self):
+        """Make sure that modified dates listed in browse view are dates of
+        the last commit to the file.
+        """
+        response = self.client().get('/code/source/').data
+        # main.c
+        ok_('<time>2015 May 26 18:05</time>' in response)
+        # binary_file
+        ok_('<time>2016 Apr 07 21:04</time>' in response)
+
     def test_pygmentize(self):
         """Check that the pygmentize FileToSkim correctly colors a file from permalink."""
         client = self.client()
-        response = client.get('/code/rev/%s/main.c' % PREVIOUS_REVISION)
+        response = client.get('/code/rev/%s/main.c' % OLDER_REVISION)
         ok_('<span class="c">// Hello World Example\n</span>' in response.data)
         # Query it again to test that the Vcs cache functions.
-        response = client.get('/code/rev/%s/main.c' % PREVIOUS_REVISION)
+        response = client.get('/code/rev/%s/main.c' % OLDER_REVISION)
         ok_('<span class="c">// Hello World Example\n</span>' in response.data)

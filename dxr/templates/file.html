@@ -13,17 +13,26 @@
 {% endblock %}
 
 {% block content %}
-  <div class="breadcrumbs">
-    {%- for path, name in paths_and_names -%}
-      {%- if not loop.first or loop.last -%}
-        <span class="path-separator">/</span><a href="{{ www_root }}{{ path }}">{{ name }}</a>
-      {%- else -%}
-        <a href="{{ www_root }}{{ path }}">{{ name }}</a>
-      {%- endif -%}
-    {%- endfor -%}
-  </div>
-
-  {{ tree_menu(tree_tuples, tree) }}
+  {% if sections %}
+    <div class="panel">
+      <button id="panel-toggle">
+        <span class="navpanel-icon expanded" aria-hidden="false"></span>
+        Navigation
+      </button>
+      <section id="panel-content" aria-expanded="true" aria-hidden="false">
+        {% for section in sections %}
+          <h4>{{ section.heading }}</h4>
+          <ul>
+            {% for item in section['items'] %}
+              <li>
+                <a href="{{ item.href }}" title="{{ item.title }}" class="{{ item.icon }} icon" {%- if 'template' in item %} data-template="{{ item.template }}" {%- endif %}>{{ item.title }}</a>
+              </li>
+            {%- endfor %}
+          </ul>
+        {% endfor %}
+      </section>
+    </div>
+  {% endif %}
 {% endblock %}
 
 {% block site_js %}

@@ -22,6 +22,9 @@ class FileToIndex(dxr.indexers.FileToIndex):
         super(FileToIndex, self).__init__(path, contents, plugin_name, tree)
         self.vcs = vcs
 
+    def is_interesting(self):
+        return not self.is_link()
+
     def links(self):
         def items():
             yield 'log', "Log", self.vcs.generate_log(vcs_relative_path)
@@ -29,7 +32,7 @@ class FileToIndex(dxr.indexers.FileToIndex):
             yield 'diff',  "Diff", self.vcs.generate_diff(vcs_relative_path)
             yield 'raw', "Raw", self.vcs.generate_raw(vcs_relative_path)
 
-        if self.vcs:
+        if self.vcs and self.vcs.has_upstream():
             vcs_relative_path = relpath(self.absolute_path(), self.vcs.get_root_dir())
             yield (5, 'VCS Links', items())
 
